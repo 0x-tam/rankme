@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import stat
 import tempfile
 import threading
 import time
@@ -42,9 +43,16 @@ class _NoRedirect(HTTPRedirectHandler):
 
 
 def _http(url, method='GET', payload=None, token='', form=False):
-    parsed = urlsplit(url)
-    if parsed.scheme != 'https' or parsed.hostname not in GOOGLE_HOSTS or parsed.username or parsed.password:
+    try:
+        parsed = urlsplit(url)
+        valid_port = parsed.port in (None, 443)
+    except ValueError:
+        raise GoogleDataError('Invalid Google service endpoint.') from None
+    if (parsed.scheme != 'https' or parsed.hostname not in GOOGLE_HOSTS or parsed.username or parsed.password
+            or not valid_port or parsed.fragment or any(ord(c) < 32 or ord(c) == 127 for c in url)):
         raise GoogleDataError('Invalid Google service endpoint.')
+    if token and (not isinstance(token, str) or len(token) > 10000 or any(ord(c) < 33 or ord(c) == 127 for c in token)):
+        raise GoogleDataError('Invalid Google authorization token. Reconnect.')
     headers = {'Accept': 'application/json'}
     data = None
     if payload is not None:
@@ -98,6 +106,38 @@ def _number(value):
         return 0.0
 
 
+def validate_goal(goal, site_url):
+    """Validate an explicit event and a same-site landing URL; never infer goals."""
+    if goal is None or goal == {}:
+        return None
+    if not isinstance(goal, dict) or set(goal) != {'event_name', 'landing_page', 'goal_type'}:
+        raise GoogleDataError('Conversion goal requires event_name, landing_page and goal_type.')
+    event, landing, kind = (goal[key] for key in ('event_name', 'landing_page', 'goal_type'))
+    if not isinstance(event, str) or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,39}', event):
+        raise GoogleDataError('Enter a GA4 event name of at most 40 letters, numbers or underscores, beginning with a letter.')
+    if kind not in ('signup', 'purchase', 'booking', 'lead'):
+        raise GoogleDataError('Choose signup, purchase, booking or lead as the conversion goal type.')
+    if not isinstance(landing, str) or len(landing) > 2048 or not landing.startswith(('https://', 'http://')):
+        raise GoogleDataError('Conversion landing page must be an absolute HTTP(S) website URL, at most 2048 characters.')
+    from .crawler import normalize_url
+    try:
+        parsed = urlsplit(landing)
+        if parsed.fragment:
+            raise ValueError()
+        landing = normalize_url(landing)
+        host = urlsplit(landing).hostname
+        if str(site_url).startswith('sc-domain:'):
+            domain = str(site_url)[10:].lower().rstrip('.')
+            matches = host == domain or host.endswith('.' + domain)
+        else:
+            matches = host.removeprefix('www.') == (urlsplit(site_url).hostname or '').removeprefix('www.')
+        if not matches:
+            raise ValueError()
+    except (ValueError, UnicodeError):
+        raise GoogleDataError('Conversion landing page must be a public URL on the selected website without credentials or fragments.') from None
+    return {'event_name': event, 'landing_page': landing, 'goal_type': kind}
+
+
 class GoogleData:
     def __init__(self, data_dir):
         self.root = Path(data_dir).resolve()
@@ -112,10 +152,20 @@ class GoogleData:
         if not self.path.exists():
             return {}
         try:
-            if self.path.stat().st_size > 100000:
-                raise GoogleDataError('Google credentials file is too large.')
-            os.chmod(self.path, 0o600)
-            data = json.loads(self.path.read_text(encoding='utf-8'))
+            # Check the opened descriptor, not a path that can change between
+            # the symlink check and read. Nonblocking prevents FIFO hangs.
+            descriptor = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(descriptor, 'r', encoding='utf-8') as handle:
+                metadata = os.fstat(handle.fileno())
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    raise GoogleDataError('Google credentials must be a regular, unshared file.')
+                if metadata.st_size > 100000:
+                    raise GoogleDataError('Google credentials file is too large.')
+                os.fchmod(handle.fileno(), 0o600)
+                raw = handle.read(100001)
+                if len(raw) > 100000:
+                    raise GoogleDataError('Google credentials file is too large.')
+                data = json.loads(raw)
             if not isinstance(data, dict):
                 raise ValueError()
             if any(key in data and not isinstance(data[key], str) for key in ('client_id', 'client_secret', 'access_token', 'refresh_token', 'scope')):
@@ -138,7 +188,7 @@ class GoogleData:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(name, self.path)
-        os.chmod(self.path, 0o600)
+        # The replaced inode already has mode 0600; do not chmod by pathname.
 
     def configure(self, client_id, client_secret=''):
         client_id = str(client_id).strip()
@@ -310,11 +360,12 @@ class GoogleData:
         return result
 
     def _search(self, site, period, dimension=None):
+        dimensions = list(dimension) if isinstance(dimension, (list, tuple)) else ([dimension] if dimension else [])
         endpoint = 'https://www.googleapis.com/webmasters/v3/sites/' + quote(site, safe='') + '/searchAnalytics/query'
         request = {'startDate': period['start'], 'endDate': period['end'], 'type': 'web', 'dataState': 'final',
-                   'aggregationType': 'auto' if dimension == 'page' else 'byProperty', 'rowLimit': 1000, 'startRow': 0}
+                   'aggregationType': 'auto' if 'page' in dimensions else 'byProperty', 'rowLimit': 1000, 'startRow': 0}
         if dimension:
-            request['dimensions'] = [dimension]
+            request['dimensions'] = dimensions
         rows = []
         for index in range(5 if dimension else 1):
             request['startRow'] = index * 1000
@@ -322,8 +373,9 @@ class GoogleData:
             batch = response.get('rows', [])
             for row in batch[:1000]:
                 item = {key: _number(row.get(key, 0)) for key in ('clicks', 'impressions', 'ctr', 'position')}
-                if dimension:
-                    item[dimension] = str((row.get('keys') or [''])[0])
+                keys = row.get('keys') or []
+                for position, name in enumerate(dimensions):
+                    item[name] = str(keys[position]) if position < len(keys) else ''
                 rows.append(item)
             if len(batch) < 1000:
                 return rows, False
@@ -342,7 +394,41 @@ class GoogleData:
                 'metadata': response.get('metadata', {}),
                 'note': 'Key events recorded in Organic Search sessions, not proof that content caused the conversion.'}
 
-    def sync(self, site_url, ga4_property=''):
+    def _conversion_period(self, property_id, period, goal):
+        page = urlsplit(goal['landing_page'])
+        landing = page.path + ('?' + page.query if page.query else '')
+        def exact(field, value):
+            return {'filter': {'fieldName': field, 'stringFilter':
+                    {'matchType': 'EXACT', 'value': value, 'caseSensitive': True}}}
+        filters = [exact('sessionDefaultChannelGroup', 'Organic Search'), exact('landingPagePlusQueryString', landing),
+                   exact('hostName', page.hostname)]
+        output = {**period, 'landing_page': goal['landing_page'], 'event_name': goal['event_name']}
+        metadata = {}
+        # Event filtering must not restrict the organic-session denominator.
+        for metric, field, event_filter in (('sessions', 'organic_sessions', False), ('eventCount', 'conversions', True)):
+            response = self._api('https://analyticsdata.googleapis.com/v1beta/properties/' + property_id + ':runReport', ANALYTICS_SCOPE,
+                {'dateRanges': [{'startDate': period['start'], 'endDate': period['end']}],
+                 'metrics': [{'name': metric}], 'dimensionFilter': {'andGroup': {'expressions':
+                    filters + ([exact('eventName', goal['event_name'])] if event_filter else [])}},
+                 'limit': '1', 'returnPropertyQuota': True})
+            rows = response.get('rows', [])
+            if not isinstance(rows, list) or len(rows) > 1:
+                raise GoogleDataError('Google returned an unexpected conversion report.')
+            if not rows:
+                output[field] = 0.0
+            else:
+                try:
+                    value = float(rows[0]['metricValues'][0]['value'])
+                    if value < 0 or value != value or abs(value) == float('inf'):
+                        raise ValueError()
+                    output[field] = value
+                except (KeyError, IndexError, TypeError, ValueError):
+                    raise GoogleDataError('Google returned an invalid conversion metric.') from None
+            metadata[field] = response.get('metadata', {})
+        output['metadata'] = metadata
+        return output
+
+    def sync(self, site_url, ga4_property='', goal_config=None):
         site_url = str(site_url).strip()
         if site_url.startswith('sc-domain:'):
             if not re.fullmatch(r'sc-domain:[A-Za-z0-9.-]+', site_url):
@@ -354,6 +440,7 @@ class GoogleData:
         property_id = str(ga4_property).removeprefix('properties/').strip()
         if property_id and not re.fullmatch(r'\d{1,30}', property_id):
             raise GoogleDataError('GA4 property ID must be numeric.')
+        goal = validate_goal(goal_config, site_url)
         today = datetime.now(timezone.utc).date()
         end = today - timedelta(days=3)
         start = end - timedelta(days=27)
@@ -365,6 +452,10 @@ class GoogleData:
                   'notes': ['Windows end three days ago to reduce incomplete-data effects; Google may still revise data.',
                             'Search Console uses Pacific dates; GA4 uses the property time zone. Cross-product totals are not directly comparable.',
                             'Query and page lists are top rows, may omit anonymized queries, and must not be summed as site totals.']}
+        measurement = {'status': 'unconfigured', 'goal': goal, 'current': None, 'previous': None,
+                       'tracking_status': 'unknown', 'issues': [],
+                       'note': 'Conversions are occurrences of the selected event on the selected hostname in Organic Search sessions with the selected landing path and query. Cross-domain events on other hosts are excluded. They are not unique customers or converting sessions and do not prove content caused a conversion. Zero observed events does not establish whether tracking is installed correctly; verify instrumentation separately.'}
+        result['conversion_measurement'] = measurement
         if self.status()['search_console']:
             search = {'limited': False}
             try:
@@ -375,6 +466,14 @@ class GoogleData:
                     search[name] = {'totals': totals[0] if totals else {'clicks': 0, 'impressions': 0, 'ctr': 0, 'position': 0},
                                     'queries': queries, 'pages': pages}
                     search['limited'] = search['limited'] or q_limit or p_limit
+                    # Joint observations, never an inferred join of the two top-row lists.
+                    try:
+                        joint, joint_limit = self._search(site_url, period, ('query', 'page'))
+                        search[name]['query_pages'] = joint
+                        search['limited'] = search['limited'] or joint_limit
+                    except GoogleDataError:
+                        search[name]['query_pages'] = []
+                        result['issues'].append('Joint query/page evidence unavailable for the %s period; cannibalization cannot be measured from separate totals.' % name)
                 result['search_console'] = search
             except GoogleDataError as exc:
                 result['issues'].append(str(exc))
@@ -385,7 +484,18 @@ class GoogleData:
                 result['analytics'] = {name: self._analytics(property_id, period) for name, period in periods.items()}
             except GoogleDataError as exc:
                 result['issues'].append(str(exc))
-        if result['search_console'] is None and result['analytics'] is None:
+        if goal:
+            measurement['status'] = 'unavailable'
+            if not property_id:
+                measurement['issues'].append('Select a GA4 property to measure the configured event.')
+            else:
+                try:
+                    measured = {name: self._conversion_period(property_id, period, goal) for name, period in periods.items()}
+                    measurement.update(measured, status='measured', tracking_status='observed' if any(p['conversions'] > 0 for p in measured.values()) else 'not_observed')
+                except GoogleDataError as exc:
+                    measurement['issues'].append(str(exc))
+            result['issues'].extend(measurement['issues'])
+        if result['search_console'] is None and result['analytics'] is None and measurement['status'] != 'measured':
             raise GoogleDataError('Google sync failed; previous data was preserved. ' + ' '.join(result['issues'][:2]), retryable=True)
         search = result['search_console']
         if search:

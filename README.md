@@ -1,12 +1,20 @@
 # RankMe
 
+## Visibility automation
+
+The **Visibility** tab connects public audits, Google observations, source-checked opportunity research, actual Codex answer samples, prioritized work, and protected article refreshes. Configure recurring audits, research, answer sampling, and bounded brief/refresh preparation per website. All 26 requested visibility areas are listed with honest implementation and integration status. See [visibility workflows](VISIBILITY.md) for setup and remaining capabilities, [security boundaries](SECURITY.md), and the [full target scope](AUTOMATION_SCOPE.md).
+
+Visibility also supports a named conversion goal, permanent measurement history, and controlled page changes. Select a signup, purchase, booking, or lead event and its landing page after connecting GA4. RankMe gives that page an explainable priority adjustment, retains every successful sync and AI sample, and observes verified refreshes of that page before allowing another refresh. You can record an external page change manually. Missing tracking, stale evidence, and inconclusive outcomes remain explicit; observed changes are not proof of causation.
+
+This extension does not yet implement every part of that target scope: arbitrary technical edits/free-tool/infographic production need dedicated adapters, and other AI platforms and comprehensive keyword/backlink coverage require integrations. Outreach is excluded by request. The existing article generation and publishing controls remain in force.
+
 RankMe is a local, single-user workspace for producing weekly articles for your clients' coded websites. Add a website, inspect the business, confirm its profile, choose a subject, and build a connected content plan. Codex researches, drafts, reviews, and revises articles. RankMe can export the result or publish it through a configured website project.
 
 The interface, database, scheduling, and files run on your computer. AI work runs through the Codex CLI using your ChatGPT sign-in. This is not offline AI: relevant business information, source material, and article text are sent to OpenAI. Your subscription's Codex allowance applies and is shared with other Codex work. RankMe does not require an OpenAI API key and rejects API-key-only sign-in.
 
 ## Requirements
 
-- macOS with Python 3.9 or later. RankMe has no third-party Python dependencies.
+- macOS with Python 3.10 or later; Python 3.12 is recommended. Install the pinned dependencies in a local virtual environment.
 - A current Codex CLI with ChatGPT sign-in and sufficient subscription capacity.
 - Internet access for research and publishing.
 - Git and the website's normal build/deployment tools when using Git publishing.
@@ -16,21 +24,40 @@ The launcher is designed for macOS. The Python application can also run directly
 
 ## Start RankMe
 
-Double-click **Start RankMe.command**. The launcher starts the local service and opens `http://127.0.0.1:8787` in your browser. It reuses an existing RankMe session on that port. Closing the browser or launcher terminal does not stop the background service.
+Set up the local Python environment once:
+
+```bash
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+Double-click **Start RankMe.command**. The launcher uses `.venv`, starts the loopback service, and opens `http://localhost:8787` in your browser. Closing the browser or launcher terminal does not stop the background service. The launcher reuses a running service only when its private process record and server instance match.
+
+To enroll the first owner passkey, explicitly run this on the Mac and complete the browser prompt:
+
+```bash
+.venv/bin/python scripts/launch.py --enroll
+```
+
+Enrollment uses a short-lived, one-use local invitation. The launcher opens it in a browser URL fragment and does not print it or pass it to the server process. Ordinary startup leaves an unowned workspace locked. Once enrolled, sign in with the passkey on later visits. Use `localhost` consistently: passkeys created for it do not work at a different host name such as `127.0.0.1`.
+
+If every owner passkey is lost, stop RankMe and run `.venv/bin/python run.py --recover-passkeys --data-dir /absolute/path/to/rankme-data` in an interactive local terminal. This explicit recovery invalidates prior credentials and sessions, then you can run the launcher with `--enroll` again. Use the actual data directory; the default is this repository's `data` folder. There is no password, email, or web reset endpoint. Recovery requires access to the macOS account and local data files.
 
 If macOS requests permission to open the downloaded command file, use Finder's **Open** action after inspecting the file. Alternatively, open a terminal in this folder and run:
 
 ```bash
-python3 scripts/launch.py
+.venv/bin/python scripts/launch.py
 ```
 
 For a foreground service with terminal output:
 
 ```bash
-python3 run.py
+.venv/bin/python run.py
 ```
 
-RankMe binds only to `127.0.0.1`. Do not expose this application through a public proxy or port forwarding. It is intended for one trusted local user, not multiple accounts or a shared server.
+The launcher cannot take over a foreground service. Stop it with **Ctrl+C** before using `scripts/launch.py --enroll` or the launcher's stop command.
+
+RankMe binds only to `127.0.0.1`. Do not expose this application through a public proxy or port forwarding. It is intended for one trusted local owner, not multiple accounts or a shared server. A passkey protects browser access from other local processes and nearby websites; it does not protect against a person who controls your macOS account or data files.
 
 ## Connect your ChatGPT subscription
 
@@ -109,27 +136,27 @@ With no connected project, a manual export saves into the configured data direct
 To inspect the background service:
 
 ```bash
-python3 scripts/launch.py --status
+.venv/bin/python scripts/launch.py --status
 ```
 
 Pause automation and wait for any running job to finish, then stop it:
 
 ```bash
-python3 scripts/launch.py --stop
+.venv/bin/python scripts/launch.py --stop
 ```
 
-The stop command validates the launcher record against the current session and process. It refuses to stop a running job. A foreground service started with `python3 run.py` should be stopped with **Ctrl+C** in its original terminal.
+The stop command validates the private launcher record against the current server instance and exact process command. It refuses to stop a running job or an unverified service. A foreground service started with `run.py` should be stopped with **Ctrl+C** in its original terminal.
 
 To restart, double-click the launcher again. Interrupted jobs are flagged for review. Publication checkpoints preserve completed operations and prevent common duplicate writes or deployments.
 
 A custom port or data directory can be selected explicitly:
 
 ```bash
-python3 scripts/launch.py --port 8788 --data-dir /absolute/path/to/rankme-data
-python3 scripts/launch.py --port 8788 --data-dir /absolute/path/to/rankme-data --stop
+.venv/bin/python scripts/launch.py --port 8788 --data-dir /absolute/path/to/rankme-data
+.venv/bin/python scripts/launch.py --port 8788 --data-dir /absolute/path/to/rankme-data --stop
 ```
 
-Use the same arguments when stopping or checking that instance. An exclusive lock prevents two servers from using the same data directory; a single worker owns scheduling. When reusing a port, the launcher opens the RankMe instance already listening there rather than switching its data directory.
+Use the same arguments when stopping or checking that instance. An exclusive lock prevents two servers from using the same data directory; a single worker owns scheduling. An occupied port with no matching private launcher record must be handled in its original terminal.
 
 ## Data and backups
 
@@ -141,7 +168,8 @@ By default, local data lives in the `data` folder beside this README:
 - `exports/`: exported articles without a connected website project.
 - `runs/`: temporary Codex working files; normal completed jobs remove their temporary directories.
 - `server.log`: background service output.
-- `launcher-PORT.json`: local process metadata. It stores a hash of the session token, not the token itself.
+- `auth/`: private passkey credentials, invitation digest, and authentication metadata.
+- `launcher-PORT.json`: private process metadata and a random server instance ID; it contains no login credential.
 
 Use the dashboard's backup download for a readable JSON snapshot of database records and settings. That JSON does **not** contain website repositories, Git credentials, Codex authentication, revision files, deployment checkpoints, or all application files. It is not a complete disaster-recovery backup, and this version has no one-click JSON restore workflow.
 
@@ -154,7 +182,7 @@ The database and backups are local files, not encrypted storage. Protect your ma
 Run the automated suite from this folder:
 
 ```bash
-python3 -m unittest discover -s tests -v
+.venv/bin/python -m unittest discover -s tests -v
 ```
 
 The suite uses temporary files and repositories and mocked network/AI results. It does not establish real client-site compatibility or guarantee live Codex availability. Validate one complete client workflow with your account and actual publishing setup before scaling to more websites.
@@ -175,7 +203,7 @@ Common problems:
 
 This release provides public-site inspection, approved business profiles, subject planning, weekly article production, review gates, local export, configurable Git/command deployment, live-page verification, activity history, and local backup export.
 
-It does not include a backlink exchange, paid keyword-volume data, automatic Search Console analytics, traffic or lead attribution, automatic article-performance refreshes, or automatic performance-based revisions. Those require additional integrations or dedicated workflows. The first release measures execution and publication status, not SEO outcomes.
+Connected Google properties now refresh automatically, and the visibility workflow can prepare protected refresh drafts from observed performance declines. Paid keyword-volume data, complete backlink coverage, arbitrary site fixes, and broader AI-platform measurements still require integrations. Link exchange and outreach are excluded. See VISIBILITY.md for precise current capabilities and limitations.
 
 ## Project evidence
 

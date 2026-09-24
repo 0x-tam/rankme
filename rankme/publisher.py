@@ -128,7 +128,10 @@ def _validate_article(article):
         if not isinstance(article.get(key), str) or not article[key].strip():
             raise PublishError('Article requires a nonempty %s.' % key)
     # Markdown renderers often allow raw HTML. Generated content must remain inert.
-    if re.search(r'<\s*/?\s*[A-Za-z!]|(?:javascript|vbscript|data)\s*:', article['body'], re.I):
+    decoded = html.unescape(article['body'])
+    compact = re.sub(r'[\x00-\x20\x7f]', '', decoded)
+    if (re.search(r'<\s*/?\s*[A-Za-z!]', decoded, re.I)
+            or re.search(r'(?:javascript|vbscript|data):', compact, re.I)):
         raise PublishError('Raw HTML and unsafe link schemes are not permitted in generated articles.')
 
 
@@ -177,6 +180,82 @@ def _atomic_write(path, data):
     finally:
         if os.path.exists(name):
             os.unlink(name)
+
+
+def _connection_hash(connection):
+    config = dict(connection, project_path=str(_project(connection)))
+    return hashlib.sha256(json.dumps(config, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def _normalized_date(text):
+    return re.sub(r'^date: .+$', 'date: <preserved>', text, count=1, flags=re.M)
+
+
+def _json_article(article):
+    public = {key: article[key] for key in ('id', 'title', 'slug', 'description', 'body', 'sources', 'claims',
+              'internal_links', 'created_at', 'published_at', 'cover') if key in article}
+    if article.get('cover', {}).get('url'):
+        public.update(image=article['cover']['url'], imageAlt=article['cover'].get('alt', ''))
+    return dict(public, rankme_id=article['id'], rankme_hash=_hash(article))
+
+
+def refresh_baseline(client, original):
+    """Capture only a verified RankMe artifact, never adopt arbitrary/manual files."""
+    connection = client.get('connection') or {}
+    checked = validate_connection(connection)
+    if not checked['ok']:
+        raise PublishError(checked['message'])
+    _validate_article(original)
+    root = _project(connection)
+    format = connection.get('format', 'md')
+    raw_path = root / connection.get('content_dir', 'content/blog') / (original['slug'] + '.' + format)
+    path = _inside(root, raw_path)
+    if raw_path.is_symlink() or not path.is_file():
+        raise PublishError('Refresh source must be an existing nonsymlink article.')
+    if path.stat().st_size > 4000000:
+        raise PublishError('Refresh source exceeds the size limit.')
+    raw = path.read_bytes()
+    text = raw.decode('utf-8')
+    result = original.get('publish_result') or {}
+    prior_baseline = original.get('refresh_baseline') or {}
+    publication_id = result.get('publication_id') or prior_baseline.get('publication_id') or original['id']
+    if _identity(text, format)[0] != publication_id:
+        raise PublishError('Refresh source ownership does not match this article.')
+    digest = hashlib.sha256(raw).hexdigest()
+    if result.get('file_sha256'):
+        if digest != result['file_sha256']:
+            raise PublishError('Article has manual changes; review before refreshing it.')
+    else:
+        public = dict(original, id=publication_id)
+        if original.get('cover'):
+            public['cover'] = {key: original['cover'].get(key) for key in ('url', 'alt', 'sha256')}
+            public['cover']['url'] = result.get('image_url') or public['cover'].get('url')
+            if original['cover'].get('format'):
+                public['cover']['format'] = original['cover']['format']
+        if format == 'json':
+            stored = json.loads(text)
+            expected = _json_article(public)
+            for key in ('created_at', 'published_at'):
+                stored.pop(key, None)
+                expected.pop(key, None)
+            if stored != expected:
+                raise PublishError('Article has manual changes; review before refreshing it.')
+        elif _normalized_date(text) != _normalized_date(export_markdown(public)):
+            raise PublishError('Article has manual changes; review before refreshing it.')
+    date = original.get('published_at') or original.get('created_at') or ''
+    created_at, published_at = original.get('created_at'), original.get('published_at')
+    if format != 'json':
+        match = re.search(r'^date: (.+)$', text.split('\n---\n', 1)[0], re.M)
+        if match:
+            date = json.loads(match.group(1))
+    else:
+        stored = json.loads(text)
+        created_at, published_at = stored.get('created_at'), stored.get('published_at')
+        date = published_at or created_at or ''
+    return {'source_article_id': original['id'], 'publication_id': publication_id,
+            'slug': original['slug'], 'file_sha256': digest,
+            'connection_sha256': _connection_hash(connection), 'publication_date': date,
+            'created_at': created_at, 'published_at': published_at}
 
 
 def _prepare_cover(article, root, storage, connection, data_dir):
@@ -260,6 +339,19 @@ def publish_article(client, article, progress=None, data_dir=None):
     _validate_article(article)
     root = _project(connection)
     format = connection.get('format', 'md')
+    baseline = None
+    if article.get('refresh_of'):
+        baseline = article.get('refresh_baseline')
+        if (not isinstance(baseline, dict) or baseline.get('source_article_id') != article['refresh_of']
+                or baseline.get('slug') != article['slug'] or not isinstance(baseline.get('publication_id'), str)
+                or not baseline['publication_id'] or not re.fullmatch(r'[a-f0-9]{64}', str(baseline.get('file_sha256', '')))
+                or baseline.get('connection_sha256') != _connection_hash(connection)):
+            raise PublishError('Refresh baseline or publishing configuration changed; prepare a new refresh.')
+        article = dict(article, id=baseline['publication_id'])
+        if baseline.get('created_at'):
+            article['created_at'] = baseline['created_at']
+        if baseline.get('publication_date'):
+            article['published_at'] = baseline['publication_date']
     if format == 'mdx' and (re.search(r'[{}<>]', article['body']) or re.search(r'^\s*(?:import|export)\s', article['body'], re.M)):
         raise PublishError('MDX articles cannot contain expressions, JSX, imports or exports. Use Markdown for code examples.')
     path = _inside(root, root / connection.get('content_dir', 'content/blog') / (article['slug'] + '.' + format))
@@ -290,19 +382,23 @@ def publish_article(client, article, progress=None, data_dir=None):
     if previous is not None and identity[0] != article['id']:
         raise PublishError('An unrelated file already occupies the article path.')
     same = identity == (article['id'], _hash(article))
+    if baseline and not same:
+        if previous is None or hashlib.sha256(path.read_bytes()).hexdigest() != baseline['file_sha256']:
+            raise PublishError('Refresh source changed or disappeared after preparation; preserve the existing file.')
     if same and format == 'json' and _hash(json.loads(previous)) != _hash(article):
         raise PublishError('Article has manual changes; review before replacing it.')
     data = export_markdown(article)
+    if baseline and same and format != 'json' and previous != data:
+        raise PublishError('Refreshed article has manual changes; preserve the existing file.')
     if same and format != 'json':
         # Preserve original publication date across retries, but reject other edits.
         normalize = lambda text: re.sub(r'^date: .+$', 'date: <preserved>', text, count=1, flags=re.M)
         if normalize(previous) != normalize(data):
             raise PublishError('Article has manual changes; review before replacing it.')
     if format == 'json':
-        public_article = {key: article[key] for key in ('id', 'title', 'slug', 'description', 'body', 'sources', 'claims', 'internal_links', 'created_at', 'published_at', 'cover') if key in article}
-        if asset:
-            public_article.update(image=asset['public']['url'], imageAlt=asset['public']['alt'])
-        data = json.dumps(dict(public_article, rankme_id=article['id'], rankme_hash=_hash(article)), ensure_ascii=False, indent=2) + '\n'
+        data = json.dumps(_json_article(article), ensure_ascii=False, indent=2) + '\n'
+        if baseline and same and json.loads(previous) != json.loads(data):
+            raise PublishError('Refreshed article has manual changes; preserve the existing file.')
     git_mode = connection.get('mode') == 'git'
     commit = None
     recovering = False
@@ -366,7 +462,9 @@ def publish_article(client, article, progress=None, data_dir=None):
         if checkpoint.get('commit') and checkpoint['commit'] != commit:
             raise PublishError('Repository HEAD changed after publication began; inspect it before retrying deployment.')
         save_checkpoint(commit=commit)
-    result = {'status': 'exported', 'path': str(path), 'live_url': None, 'commit': commit, 'message': 'Article saved locally. Deployment is not enabled.'}
+    result = {'status': 'exported', 'path': str(path), 'live_url': None, 'commit': commit,
+              'file_sha256': hashlib.sha256(path.read_bytes()).hexdigest(), 'publication_id': article['id'],
+              'message': 'Article saved locally. Deployment is not enabled.'}
     if asset:
         result.update(image_path=str(asset['path']), image_url=asset['public']['url'])
     if not connection.get('auto_publish'):

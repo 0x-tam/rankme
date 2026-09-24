@@ -1,0 +1,15 @@
+# Upload only the static frontend source and its deterministic build script.
+/*
+!/package.json
+!/package-lock.json
+!/vercel.json
+!/scripts/
+/scripts/*
+!/scripts/build-web.mjs
+!/static/
+/static/*
+!/static/index.html
+!/static/app.js
+!/static/auth.js
+!/static/styles.css
+!/static/favicon.svg

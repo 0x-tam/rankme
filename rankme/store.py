@@ -16,7 +16,7 @@ def uid():
 
 
 class Store:
-    TABLES = {"clients", "articles", "jobs", "events", "seo", "backlinks"}
+    TABLES = {"clients", "articles", "jobs", "events", "seo", "backlinks", "visibility", "opportunities", "research", "tasks", "answer_probes", "measurements", "experiments"}
 
     def __init__(self, path):
         self.path = Path(path)
@@ -27,6 +27,7 @@ class Store:
         self.db.execute("PRAGMA busy_timeout=5000")
         for table in self.TABLES:
             self.db.execute("CREATE TABLE IF NOT EXISTS " + table + " (id TEXT PRIMARY KEY, data TEXT NOT NULL)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS measurements_client ON measurements(json_extract(data, '$.client_id'))")
         self.db.execute("CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL)")
         self.db.commit()
 
@@ -46,21 +47,57 @@ class Store:
                 raise KeyError("Record not found")
             return json.loads(row[0])
 
+    def history(self, client_id, limit=None):
+        """Read history without loading every other client's retained snapshots."""
+        sql = "SELECT data FROM measurements WHERE json_extract(data, '$.client_id')=? ORDER BY rowid DESC"
+        values = [client_id]
+        if limit is not None:
+            sql += " LIMIT ?"
+            values.append(max(0, int(limit)))
+        with self.lock:
+            return [json.loads(row[0]) for row in self.db.execute(sql, values)]
+
+    def history_counts(self):
+        with self.lock:
+            return dict(self.db.execute("SELECT json_extract(data, '$.client_id'), COUNT(*) FROM measurements GROUP BY json_extract(data, '$.client_id')"))
+
     def put(self, table, data):
         record = dict(data)
         record.setdefault("id", uid())
         record.setdefault("created_at", now())
         record["updated_at"] = now()
         with self.lock, self.db:
-            self.db.execute("INSERT OR REPLACE INTO " + self._table(table) + " (id,data) VALUES (?,?)",
+            verb = "INSERT OR IGNORE" if table == "measurements" else "INSERT OR REPLACE"
+            self.db.execute(verb + " INTO " + self._table(table) + " (id,data) VALUES (?,?)",
                             (record["id"], json.dumps(record, ensure_ascii=False)))
+            if table == "measurements":
+                return self.get(table, record["id"])
         return record
 
     def update(self, table, ident, **fields):
+        if table == "measurements":
+            raise ValueError("Measurement history is append-only")
         with self.lock:
             record = self.get(table, ident)
             record.update(fields)
             return self.put(table, record)
+
+    def put_many(self, records):
+        """Commit dependent records together, without nested per-record commits."""
+        prepared = []
+        for table, value in records:
+            self._table(table)
+            record = dict(value)
+            record.setdefault("id", uid())
+            record.setdefault("created_at", now())
+            record["updated_at"] = now()
+            prepared.append((table, record))
+        with self.lock, self.db:
+            for table, record in prepared:
+                verb = "INSERT OR IGNORE" if table == "measurements" else "INSERT OR REPLACE"
+                self.db.execute(verb + " INTO " + table + " (id,data) VALUES (?,?)",
+                                (record["id"], json.dumps(record, ensure_ascii=False)))
+            return [self.get(table, record["id"]) if table == "measurements" else record for table, record in prepared]
 
     def settings(self, fields=None):
         defaults = {"codex_path": "codex", "model": "", "paused": False,

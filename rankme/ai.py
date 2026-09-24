@@ -66,11 +66,12 @@ class CodexRunner:
         self.timeout = 1200
 
     def _env(self):
-        env = dict(os.environ)
-        for name in list(env):
-            if name in ('OPENAI_API_KEY', 'OPENAI_BASE_URL', 'OPENAI_ORG_ID', 'OPENAI_PROJECT_ID', 'CODEX_API_KEY', 'AZURE_OPENAI_API_KEY', 'ANTHROPIC_API_KEY'):
-                env.pop(name, None)
-        return env
+        # Deny by default: cloud, GitHub, CMS, Google, SSH and deployment secrets
+        # must never be inherited by a process that handles untrusted web text.
+        allowed = {'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'TMPDIR', 'TMP', 'TEMP',
+                   'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'SYSTEMROOT', 'WINDIR',
+                   'LOCALAPPDATA', 'APPDATA', 'USERPROFILE', 'CODEX_HOME'}
+        return {name: value for name, value in os.environ.items() if name in allowed}
 
     def status(self):
         status = {'available': False, 'authenticated': False, 'method': '', 'message': '', 'version': ''}
