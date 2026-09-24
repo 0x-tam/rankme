@@ -1,0 +1,478 @@
+"""Persisted queue, weekly scheduling and the inspection-to-publication workflow."""
+import hashlib
+import json
+import re
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import urlparse
+
+from .store import now, uid
+from .quality import check_article
+
+
+def parse_date(value):
+    date = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if date.tzinfo is None:
+        raise ValueError("Dates must include a timezone")
+    return date.astimezone(timezone.utc)
+
+
+def first_run():
+    return (datetime.now().astimezone() + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0).astimezone(timezone.utc).isoformat()
+
+
+def content_digest(article):
+    fields = {k: article.get(k) for k in ("title", "slug", "description", "body", "sources", "claims")}
+    return hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
+
+
+def profile_digest(client):
+    return hashlib.sha256(json.dumps({"profile": client.get("profile"), "url": client.get("url")}, sort_keys=True).encode()).hexdigest()
+
+
+def brand_digest(client):
+    brand = client.get("image_brand") or {}
+    return hashlib.sha256(json.dumps({"colors": brand.get("colors", []), "style": brand.get("style", ""), "audience": client.get("profile", {}).get("audience", ""), "tone": client.get("profile", {}).get("tone", "")}, sort_keys=True).encode()).hexdigest()
+
+
+def safe_error(error):
+    message = str(error)[:1500] or type(error).__name__
+    message = re.sub(r"(https?://)[^\s/@]+:[^\s/@]+@", r"\1[redacted]@", message)
+    message = re.sub(r"(?i)(token|api[_-]?key|password|authorization)([=: ]+)[^\s,;]+", r"\1\2[redacted]", message)
+    return message
+
+
+class Engine:
+    def __init__(self, store, data_dir, runner_factory=None):
+        self.store = store
+        self.data_dir = Path(data_dir)
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.runner_factory = runner_factory
+        from .google_data import GoogleData
+        self.google = GoogleData(self.data_dir)
+        self.stop_event = threading.Event()
+        self.wake = threading.Event()
+        self.guard = threading.RLock()
+        self.worker = None
+        self.codex_status = {"available": False, "authenticated": False, "method": "", "message": "Checking Codex sign-in…"}
+
+    def runner(self):
+        settings = self.store.settings()
+        if self.runner_factory:
+            return self.runner_factory()
+        from .ai import CodexRunner
+        return CodexRunner(self.data_dir / "runs", executable=settings["codex_path"], model=settings["model"])
+
+    def check_status(self):
+        try:
+            self.codex_status = self.runner().status()
+        except Exception as exc:
+            self.codex_status = {"available": False, "authenticated": False, "method": "", "message": str(exc)[:500]}
+        return self.codex_status
+
+    def start(self):
+        # Never silently repeat a possibly completed external publication after a crash.
+        for job in self.store.all("jobs"):
+            if job["status"] == "running":
+                self.store.update("jobs", job["id"], status="failed", error="RankMe stopped during this job. Review its state and retry.")
+                self.store.event("Interrupted job needs attention: " + job["kind"], job.get("client_id"), "warning")
+        self.worker = threading.Thread(target=self.loop, name="rankme-worker", daemon=True)
+        self.worker.start()
+        threading.Thread(target=self.check_status, name="rankme-codex-status", daemon=True).start()
+
+    def queue(self, kind, client_id, article_id=None, **extra):
+        if kind not in ("inspect", "plan", "generate", "review", "cover", "publish", "verify", "seo-sync", "backlinks-discover", "backlink-check"):
+            raise ValueError("Unknown job type")
+        self.store.get("clients", client_id)
+        with self.guard:
+            pending = [j for j in self.store.all("jobs") if j["status"] in ("queued", "running") and j["client_id"] == client_id]
+            if pending:
+                raise ValueError("This client already has a queued or running job. Wait for it to finish.")
+            if article_id:
+                article = self.store.get("articles", article_id)
+                if article["client_id"] != client_id:
+                    raise ValueError("Article does not belong to this client")
+            job = self.store.put("jobs", {"kind": kind, "client_id": client_id, "article_id": article_id,
+                                         "status": "queued", "stage": "Waiting", "error": "", "attempts": 0, **extra})
+            for previous in self.store.all("jobs"):
+                same_work = previous["kind"] == kind or (kind == "generate" and previous["kind"] in ("cover", "review")) or (kind in ("publish", "cover") and previous["kind"] == "generate" and article_id)
+                if kind == "backlink-check" and previous.get("backlink_id") != extra.get("backlink_id"):
+                    same_work = False
+                if previous["status"] == "failed" and previous["client_id"] == client_id and previous.get("article_id") == article_id and same_work:
+                    self.store.update("jobs", previous["id"], status="retried")
+            self.store.event(kind.capitalize() + " queued", client_id)
+            self.wake.set()
+            return job
+
+    def retry(self, ident):
+        job = self.store.get("jobs", ident)
+        if job["status"] != "failed":
+            raise ValueError("Only failed jobs can be retried")
+        kind = job["kind"]
+        resume = job.get("resume_generation", False)
+        if job.get("article_id"):
+            article = self.store.get("articles", job["article_id"])
+            if kind == "generate" and article.get("publish_started"):
+                kind = "publish"
+            elif kind == "generate" and article.get("reviewed_digest") == content_digest(article):
+                kind, resume = "cover", True
+        result = self.queue(kind, job["client_id"], job.get("article_id"), scheduled=job.get("scheduled", False), resume_generation=resume, backlink_id=job.get("backlink_id"))
+        self.store.update("jobs", ident, status="retried")
+        return result
+
+    def articles(self, client_id):
+        return sorted([a for a in self.store.all("articles") if a["client_id"] == client_id], key=lambda a: a.get("scheduled_at", ""))
+
+    def schedule_tick(self):
+        if self.store.settings()["paused"]:
+            return
+        current = datetime.now(timezone.utc)
+        for article in self.store.all("articles"):
+            if article["status"] != "verification_pending" or article.get("verification_attempts", 0) >= 12:
+                continue
+            client = self.store.get("clients", article["client_id"])
+            if not client.get("automation"):
+                continue
+            last = article.get("last_verified_at") or article.get("updated_at")
+            if last and (current - parse_date(last)).total_seconds() < 300:
+                continue
+            try:
+                self.queue("verify", client["id"], article["id"])
+            except ValueError:
+                pass
+        for client in self.store.all("clients"):
+            if not client.get("automation") or not client.get("confirmed") or not client.get("subject"):
+                continue
+            if client["status"] not in ("active", "ready"):
+                continue
+            try:
+                due = parse_date(client.get("next_run", first_run()))
+            except (ValueError, TypeError):
+                continue
+            if due > current:
+                continue
+            if any(j["client_id"] == client["id"] and (j["status"] in ("queued", "running") or (j["status"] == "failed" and j["kind"] not in ("seo-sync", "backlinks-discover", "backlink-check"))) for j in self.store.all("jobs")):
+                continue
+            planned = [a for a in self.articles(client["id"]) if a["status"] == "planned"]
+            try:
+                if planned:
+                    if planned[0].get("scheduled_at") and parse_date(planned[0]["scheduled_at"]) > current:
+                        continue
+                    self.queue("generate", client["id"], planned[0]["id"], scheduled=True)
+                else:
+                    self.queue("plan", client["id"], scheduled=True)
+            except ValueError:
+                pass
+
+    def data_schedule_tick(self):
+        """Refresh connected metrics daily and known links weekly while RankMe runs."""
+        if self.store.settings()["paused"]:
+            return
+        current = datetime.now(timezone.utc)
+        for client in self.store.all("clients"):
+            if any(j["client_id"] == client["id"] and j["status"] in ("queued", "running") for j in self.store.all("jobs")):
+                continue
+            connection = client.get("seo_connection", {})
+            last = client.get("seo_attempt_at")
+            if connection.get("auto_sync", True) and connection.get("site_url") and self.google.status().get("connected") and (not last or (current - parse_date(last)).total_seconds() >= 86400):
+                self.queue("seo-sync", client["id"])
+                continue
+            for link in self.store.all("backlinks"):
+                if link.get("client_id") != client["id"] or link.get("status") == "dismissed":
+                    continue
+                checked = link.get("last_check_attempt") or link.get("created_at")
+                if checked and (current - parse_date(checked)).total_seconds() >= 7 * 86400:
+                    self.queue("backlink-check", client["id"], backlink_id=link["id"])
+                    break
+
+    def loop(self):
+        while not self.stop_event.is_set():
+            try:
+                self.schedule_tick()
+                self.data_schedule_tick()
+                queued = sorted([j for j in self.store.all("jobs") if j["status"] == "queued"], key=lambda j: j["created_at"])
+                if queued and not self.store.settings()["paused"]:
+                    self.execute(queued[0])
+                    continue
+            except Exception as exc:
+                self.store.event("Worker error: " + safe_error(exc), level="error")
+            self.wake.wait(15)
+            self.wake.clear()
+
+    def advance(self, client_id):
+        # One catch-up article only. No flood of old publications after a long shutdown.
+        client = self.store.get("clients", client_id)
+        current = datetime.now(timezone.utc)
+        try:
+            due = parse_date(client["next_run"])
+        except (ValueError, KeyError):
+            due = current
+        while due <= current:
+            due += timedelta(days=7)
+        self.store.update("clients", client_id, next_run=due.isoformat())
+
+    def execute(self, job):
+        from . import ai, crawler
+        client_id = job["client_id"]
+        article_id = job.get("article_id")
+        self.store.update("jobs", job["id"], status="running", started_at=now(), attempts=job.get("attempts", 0) + 1)
+
+        def progress(message):
+            self.store.update("jobs", job["id"], stage=str(message)[:400])
+
+        try:
+            client = self.store.get("clients", client_id)
+            if job["kind"] == "seo-sync":
+                self.store.update("clients", client_id, seo_attempt_at=now())
+                connection = client.get("seo_connection", {})
+                if not connection.get("site_url"):
+                    raise ValueError("Select a Search Console property first")
+                progress("Reading Search Console and analytics performance")
+                snapshot = self.google.sync(connection["site_url"], connection.get("ga4_property", ""))
+                self.store.put("seo", {**snapshot, "id": client_id, "client_id": client_id})
+                self.store.update("clients", client_id, seo_error="")
+            elif job["kind"] == "backlinks-discover":
+                from .backlinks import discover_prospects
+                progress("Researching relevant backlink opportunities")
+                prospects = discover_prospects(self.runner(), client, progress=progress)
+                existing = {b["source_url"] for b in self.store.all("backlinks") if b["client_id"] == client_id}
+                for prospect in prospects:
+                    if prospect["source_url"] not in existing:
+                        self.store.put("backlinks", {**prospect, "id": uid(), "client_id": client_id, "target_url": client["url"]})
+                        existing.add(prospect["source_url"])
+                self.store.event(str(len(prospects)) + " backlink prospects researched. Outreach remains drafts.", client_id)
+            elif job["kind"] == "backlink-check":
+                from .backlinks import verify_backlink
+                link = self.store.get("backlinks", job["backlink_id"])
+                if link["client_id"] != client_id:
+                    raise ValueError("Link does not belong to this client")
+                self.store.update("backlinks", link["id"], last_check_attempt=now())
+                progress("Checking the public page for the backlink")
+                result = verify_backlink(link["source_url"], link.get("target_url") or client["url"])
+                fields = {"verification": result}
+                if result.get("status") == "missing" and link.get("status") == "live":
+                    fields["status"] = "prospect"
+                if result.get("live"):
+                    fields["first_seen_at"] = link.get("first_seen_at") or result["checked_at"]
+                    fields["last_seen_at"] = result["checked_at"]
+                self.store.update("backlinks", link["id"], **fields)
+            elif job["kind"] == "inspect":
+                self.store.update("clients", client_id, status="inspecting", error="")
+                progress("Inspecting public website pages")
+                crawl = crawler.crawl_site(client["url"], max_pages=self.store.settings()["max_pages"], progress=progress)
+                if not crawl.get("pages"):
+                    raise ValueError("No readable pages found. Check the URL, robots policy, or website access.")
+                self.store.update("clients", client_id, crawl=crawl)
+                progress("Building the company profile and suggested subjects")
+                profile = ai.inspect_business(self.runner(), crawl, progress=progress)
+                if not client.get("image_brand", {}).get("colors"):
+                    from .brand import extract_brand
+                    try:
+                        self.store.update("clients", client_id, image_brand=extract_brand(client["url"]))
+                    except (ValueError, OSError):
+                        self.store.event("Brand colors could not be detected. Add them in the business profile before generating a cover.", client_id, "warning")
+                self.store.update("clients", client_id, profile=profile, name=profile.get("name") or client["name"],
+                                  status="needs_confirmation", confirmed=False, automation=False, error="")
+            elif job["kind"] == "plan":
+                if not client.get("confirmed") or not client.get("subject"):
+                    raise ValueError("Confirm the business profile and choose a subject first")
+                progress("Researching a connected 12-week content plan")
+                self.store.update("clients", client_id, status="planning", error="")
+                existing = self.articles(client_id)
+                try:
+                    metrics = self.store.get("seo", client_id)
+                    search = metrics.get("search_console") or {}
+                    evidence = {"periods": metrics.get("periods"), "updated_at": metrics.get("updated_at"), "recommendations": metrics.get("recommendations", [])[:6],
+                        "note": "Historical connected-site data; check dates for freshness. Top rows are not exhaustive or market search volumes.",
+                        "search_console": {period: {"totals": search.get(period, {}).get("totals"),
+                            "queries": search.get(period, {}).get("queries", [])[:50], "pages": search.get(period, {}).get("pages", [])[:50]}
+                            for period in ("current", "previous")}}
+                    client = {**client, "seo_evidence": evidence}
+                except KeyError:
+                    pass
+                plan = ai.plan_articles(self.runner(), client, existing, progress=progress)
+                items = plan.get("articles", [])
+                if not items or len(items) > 12:
+                    raise ValueError("The planner did not return a valid content plan")
+                due = parse_date(client.get("next_run") or first_run())
+                old_topics = [a for a in existing if a["status"] == "planned" and a.get("subject") != client["subject"]]
+                existing_dates = [parse_date(a["scheduled_at"]) for a in existing if a.get("scheduled_at") and a["status"] == "planned" and a not in old_topics]
+                if existing_dates:
+                    due = max(due, max(existing_dates) + timedelta(days=7))
+                titles = {a.get("title", "").lower().strip() for a in existing}
+                count = 0
+                for item in items:
+                    if not isinstance(item, dict) or not item.get("title") or item["title"].lower().strip() in titles:
+                        continue
+                    titles.add(item["title"].lower().strip())
+                    self.store.put("articles", {**item, "id": uid(), "client_id": client_id, "status": "planned", "subject": client["subject"],
+                                                "scheduled_at": (due + timedelta(days=count * 7)).isoformat(), "body": "", "error": ""})
+                    count += 1
+                if not count:
+                    raise ValueError("No distinct article topics found. Choose a more specific subject.")
+                for old in old_topics:
+                    self.store.update("articles", old["id"], status="superseded")
+                self.store.update("clients", client_id, status="active" if self.store.get("clients", client_id).get("automation") else "ready", error="")
+                self.store.event("Content plan ready: " + str(count) + " articles", client_id)
+            elif job["kind"] in ("generate", "review"):
+                if not client.get("confirmed"):
+                    raise ValueError("Confirm the business profile before producing content")
+                article = self.store.get("articles", article_id)
+                if article.get("publish_started") or article["status"] in ("published", "verification_pending", "exported"):
+                    raise ValueError("Published/exported articles cannot be regenerated in place. Create a new draft.")
+                existing = self.articles(client_id)
+                runner = self.runner()
+                feedback = ""
+                tries = 2 if job["kind"] == "generate" else 1
+                for attempt in range(tries):
+                    if job["kind"] == "generate":
+                        self.store.update("articles", article_id, status="writing", error="")
+                        progress("Researching and writing" if not attempt else "Repairing review findings")
+                        draft = ai.write_article(runner, client, article, existing, feedback=feedback, progress=progress)
+                        allowed = {k: draft[k] for k in ("title", "slug", "description", "body", "sources", "claims", "internal_links") if k in draft}
+                        article = self.store.update("articles", article_id, **allowed)
+                        self._snapshot(article)
+                    self.store.update("articles", article_id, status="reviewing")
+                    progress("Checking claims, sources, relevance, and article structure")
+                    checks = check_article(article, client, existing)
+                    review = ai.review_article(runner, client, article, progress=progress)
+                    passed = checks["passed"] and review.get("passed") is True and not review.get("issues")
+                    article = self.store.update("articles", article_id, checks=checks, review=review,
+                                                reviewed_digest=content_digest(article) if passed else "",
+                                                reviewed_profile=profile_digest(client) if passed else "",
+                                                status="ready" if passed else "held")
+                    if passed:
+                        break
+                    feedback = json.dumps({"structural": checks["issues"], "review": review}, ensure_ascii=False)
+                if article["status"] == "held":
+                    self.store.event("Article held: " + article["title"] + ". Review its findings before retrying.", client_id, "warning")
+                else:
+                    latest = self.store.get("clients", client_id)
+                    article = self.prepare_cover(latest, article, progress)
+                    latest = self.store.get("clients", client_id)
+                    if article["status"] == "ready" and latest.get("connection", {}).get("auto_publish") and latest.get("status") != "paused" and not self.store.settings()["paused"]:
+                        self.publish(latest, article, progress)
+                if job.get("scheduled"):
+                    self.advance(client_id)
+            elif job["kind"] == "cover":
+                article = self.store.get("articles", article_id)
+                if not client.get("confirmed") or not article.get("body"):
+                    raise ValueError("Confirm the profile and write an article before generating its cover")
+                if article.get("publish_started") or article["status"] in ("published", "exported", "verification_pending"):
+                    raise ValueError("Published article covers are preserved")
+                article = self.prepare_cover(client, article, progress, force=not job.get("resume_generation"))
+                if job.get("resume_generation"):
+                    latest = self.store.get("clients", client_id)
+                    if article["status"] == "ready" and latest.get("connection", {}).get("auto_publish") and latest.get("status") != "paused" and not self.store.settings()["paused"]:
+                        self.publish(latest, article, progress)
+                    if job.get("scheduled"):
+                        self.advance(client_id)
+            elif job["kind"] == "publish":
+                self.publish(client, self.store.get("articles", article_id), progress)
+                if job.get("scheduled"):
+                    self.advance(client_id)
+            elif job["kind"] == "verify":
+                from .publisher import verify_live
+                article = self.store.get("articles", article_id)
+                result = article.get("publish_result", {})
+                if not result.get("live_url"):
+                    raise ValueError("No live article URL is configured")
+                progress("Verifying the live article")
+                verified = verify_live(result["live_url"], article["title"])
+                result = {**result, "status": "published" if verified.get("ok") else "verification_pending", "message": verified.get("message", "")}
+                self.store.update("articles", article_id, verification=verified,
+                                  publish_result=result, last_verified_at=now(), verification_attempts=article.get("verification_attempts", 0) + 1,
+                                  status="published" if verified.get("ok") else "verification_pending")
+            self.store.update("jobs", job["id"], status="completed", stage="Complete", finished_at=now(), error="")
+            self.store.event(job["kind"].capitalize() + " completed", client_id)
+        except Exception as exc:
+            message = safe_error(exc)
+            self.store.update("jobs", job["id"], status="failed", stage="Needs attention", finished_at=now(), error=message)
+            if job["kind"] == "seo-sync":
+                self.store.update("clients", client_id, seo_error=message)
+            if job["kind"] in ("inspect", "plan"):
+                self.store.update("clients", client_id, status="error", error=message)
+            elif article_id:
+                article = self.store.get("articles", article_id)
+                if article["status"] not in ("published", "exported", "verification_pending"):
+                    self.store.update("articles", article_id, status="error", error=message)
+            self.store.event(message, client_id, "error")
+
+    def _snapshot(self, article):
+        folder = self.data_dir / "revisions" / article["id"]
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / (str(time.time_ns()) + ".json")).write_text(json.dumps(article, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def cover_valid(self, client, article):
+        cover = article.get("cover") or {}
+        if not cover.get("review", {}).get("passed") or cover.get("review", {}).get("issues"):
+            return False
+        if cover.get("reviewed_article_digest") != content_digest(article) or cover.get("reviewed_brand_digest") != brand_digest(client):
+            return False
+        try:
+            path = Path(cover["path"])
+            path.resolve().relative_to((self.data_dir / "covers").resolve())
+            if path.is_symlink() or not 0 < path.stat().st_size <= 20_000_000:
+                return False
+            return hashlib.sha256(path.read_bytes()).hexdigest() == cover.get("sha256")
+        except (ValueError, KeyError, OSError):
+            return False
+
+    def prepare_cover(self, client, article, progress, force=False):
+        from .covers import generate_cover
+        if not client.get("image_brand", {}).get("colors"):
+            from .brand import extract_brand
+            try:
+                detected = extract_brand(client["url"])
+            except (ValueError, OSError):
+                detected = {}
+            if not detected.get("colors"):
+                raise ValueError("Add brand colors in the business profile before generating the cover. No reliable palette was detected.")
+            client = self.store.update("clients", client["id"], image_brand=detected)
+        if not force and self.cover_valid(client, article):
+            return article
+        self.store.update("articles", article["id"], status="generating_cover", error="")
+        progress("Creating a 3D cover matched to the brand and article audience")
+        cover = generate_cover(self.runner(), client, article, self.data_dir, progress=progress)
+        cover.update(reviewed_article_digest=content_digest(article), reviewed_brand_digest=brand_digest(client))
+        article = self.store.update("articles", article["id"], cover=cover, cover_stale=False)
+        text_passed = article.get("review", {}).get("passed") and not article.get("review", {}).get("issues") and article.get("reviewed_digest") == content_digest(article) and article.get("reviewed_profile") == profile_digest(client)
+        ready = bool(text_passed and self.cover_valid(client, article))
+        article = self.store.update("articles", article["id"], status="ready" if ready else "held")
+        self._snapshot(article)
+        if not ready:
+            self.store.event("Article held: its text or cover needs review.", client["id"], "warning")
+        return article
+
+    def publish(self, client, article, progress):
+        from .publisher import publish_article
+        if not client.get("confirmed") or not article.get("review", {}).get("passed") or article.get("reviewed_digest") != content_digest(article):
+            raise ValueError("This article needs a successful review before publishing")
+        if article.get("reviewed_profile") != profile_digest(client):
+            raise ValueError("Business profile changed. Review the article against the current profile before publishing.")
+        if not self.cover_valid(client, article):
+            raise ValueError("Generate a reviewed cover matching the current article and brand before publishing")
+        checks = check_article(article, client, self.articles(client["id"]))
+        if not checks["passed"]:
+            raise ValueError("Publication checks failed: " + "; ".join(checks["issues"]))
+        connection = dict(client.get("connection") or {})
+        if not connection.get("project_path"):
+            path = self.data_dir / "exports" / client["id"]
+            path.mkdir(parents=True, exist_ok=True)
+            connection.update(project_path=str(path), content_dir="articles", mode="export", format="md", auto_publish=False, deploy_command=[], build_command=[])
+        publish_client = {**client, "connection": connection}
+        self.store.update("articles", article["id"], status="publishing", publish_started=True, error="")
+        progress("Publishing and verifying the article")
+        result = publish_article(publish_client, article, progress=progress, data_dir=self.data_dir)
+        self.store.update("articles", article["id"], status=result["status"], publish_result=result, error="")
+
+    def state(self):
+        articles = self.store.all("articles")
+        jobs = sorted(self.store.all("jobs"), key=lambda j: j["created_at"], reverse=True)[:150]
+        events = sorted(self.store.all("events"), key=lambda j: j["created_at"], reverse=True)[:200]
+        return {"clients": self.store.all("clients"), "articles": articles, "jobs": jobs, "events": events,
+                "settings": self.store.settings(), "status": self.codex_status,
+                "google": self.google.status(), "seo": self.store.all("seo"), "backlinks": self.store.all("backlinks"),
+                "server": {"version": "1.0.0", "local": True}}
