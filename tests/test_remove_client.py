@@ -68,9 +68,12 @@ class RemoveClientTests(unittest.TestCase):
         self.remove('eoncoatings.com')
         self.assertTrue((outside / 'keep.txt').exists())
 
-    def test_the_cloud_workspace_cannot_remove_websites(self):
+    def test_the_cloud_workspace_can_remove_only_with_a_typed_confirmation(self):
         from rankme.cloud_bridge import allowed_command
-        self.assertFalse(allowed_command('POST', '/api/clients/' + 'a' * 32 + '/remove', {'confirm': 'eoncoatings.com'}))
+        path = '/api/clients/' + 'a' * 32 + '/remove'
+        self.assertTrue(allowed_command('POST', path, {'confirm': 'eoncoatings.com'}))
+        for body in ({}, {'confirm': ''}, {'confirm': 7}, {'confirm': 'x.com', 'extra': 1}):
+            self.assertFalse(allowed_command('POST', path, body))
 
     def test_unknown_website_is_not_found(self):
         with self.assertRaises(KeyError):

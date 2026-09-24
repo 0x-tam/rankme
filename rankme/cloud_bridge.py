@@ -61,12 +61,15 @@ def allowed_command(method, path, body):
         (rf"/api/clients/{ID}/plan", {"subject"}),
         (rf"/api/clients/{ID}/backlinks", {"source_url", "notes"}),
         (rf"/api/clients/{ID}/experiments", {"page_url", "hypothesis", "change"}),
-        (rf"/api/articles/{ID}/(?:generate|review|cover|publish|verify)", set()),
+        (rf"/api/articles/{ID}/(?:generate|review|cover|publish|verify|remove|remove-cover)", set()),
         (rf"/api/backlinks/{ID}/check", set()),
         (rf"/api/opportunities/{ID}/execute", set()),
         (rf"/api/experiments/{ID}/cancel", set()),
-        (rf"/api/jobs/{ID}/retry", set()),
+        (rf"/api/jobs/{ID}/(?:retry|stop|dismiss)", set()),
     )
+    # Removing a website needs the typed address; the Mac checks it again before deleting anything.
+    if re.fullmatch(rf"/api/clients/{ID}/remove", path):
+        return fields == {"confirm"} and isinstance(body["confirm"], str) and 0 < len(body["confirm"]) <= 300
     return any(re.fullmatch(pattern, path) and fields <= permitted for pattern, permitted in patterns)
 
 
