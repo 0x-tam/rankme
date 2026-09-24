@@ -3,7 +3,8 @@
     "build:web": "node scripts/build-web.mjs",
     "typecheck": "tsc --noEmit --target ES2022 --module esnext --moduleResolution bundler cloud/index.ts neon.ts",
     "cloud:migrate": "node --import tsx scripts/cloud-admin.ts migrate",
-    "cloud:bootstrap": "node --import tsx scripts/cloud-admin.ts bootstrap"
+    "cloud:bootstrap": "node --import tsx scripts/cloud-admin.ts bootstrap",
+    "cloud:invite-passkey": "node --import tsx scripts/cloud-admin.ts invite-passkey"
   },
   "dependencies": {
     "@neon/config": "^1.7.3",

@@ -18,6 +18,11 @@
       <p id="auth-description">Unlock your content workspace with your passkey.</p>
       <p id="auth-error" class="auth-error" role="alert" hidden></p>
       <div id="auth-login" hidden><button id="auth-sign-in" class="button primary auth-button" type="button">Continue with passkey</button></div>
+      <form id="auth-invite" hidden>
+        <label for="auth-invite-name">Name this passkey</label>
+        <input id="auth-invite-name" name="name" type="text" maxlength="80" autocomplete="off" value="My device">
+        <button class="button primary auth-button" type="submit">Add passkey on this device</button>
+      </form>
       <form id="auth-enroll" hidden>
         <div id="auth-bootstrap-field"><label for="auth-bootstrap">One-time setup code</label>
         <input id="auth-bootstrap" name="bootstrap" type="text" autocomplete="off" spellcheck="false" placeholder="Paste the code from your setup link">

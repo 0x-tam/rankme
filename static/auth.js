@@ -1,8 +1,8 @@
 'use strict';
 // The server keeps the session in an HttpOnly cookie. This module keeps only the
-// CSRF value and the short-lived first-setup code in memory.
+// CSRF value and short-lived setup/invitation secrets in memory.
 const RankMeAuth = (() => {
-  let csrf = '', bootstrap = '', authenticated = false, callbacks = {};
+  let csrf = '', bootstrap = '', invite = '', authenticated = false, callbacks = {};
   const channel = typeof BroadcastChannel === 'function' ? new BroadcastChannel('rankme-auth') : null;
   const $ = selector => document.querySelector(selector);
   const binary = value => {
@@ -88,15 +88,17 @@ const RankMeAuth = (() => {
     authenticated = false;
     $('#auth-screen').hidden = false;
     $('.app').hidden = true;
-    $('#auth-login').hidden = !enrolled;
+    $('#auth-login').hidden = !enrolled || Boolean(invite);
+    $('#auth-invite').hidden = !enrolled || !invite;
     $('#auth-enroll').hidden = enrolled;
-    $('#auth-title').textContent = enrolled ? 'Welcome back.' : 'Make this workspace yours.';
-    $('#auth-description').textContent = enrolled ? 'Unlock your content workspace with your passkey.' : 'Create the first passkey to secure your workspace.';
+    $('#auth-title').textContent = enrolled && invite ? 'Add a passkey.' : enrolled ? 'Welcome back.' : 'Make this workspace yours.';
+    $('#auth-description').textContent = enrolled && invite ? 'Save a passkey to this device or its password manager. Your existing passkeys stay active.' :
+      enrolled ? 'Unlock your content workspace with your passkey.' : 'Create the first passkey to secure your workspace.';
     if (!supported()) showError(errorMessage());
   }
   async function status() {
     const result = await request('/api/auth/status');
-    csrf = result.csrf || '';
+    csrf = (invite ? result.preCsrf : result.csrf) || '';
     return result;
   }
   async function unlock() {
@@ -104,6 +106,7 @@ const RankMeAuth = (() => {
     csrf = session.csrf || session.token || '';
     authenticated = true;
     bootstrap = '';
+    invite = '';
     $('#auth-bootstrap').value = '';
     showError('');
     await callbacks.onUnlock?.();
@@ -113,6 +116,7 @@ const RankMeAuth = (() => {
     authenticated = false;
     csrf = '';
     bootstrap = '';
+    invite = '';
     $('#auth-bootstrap').value = '';
     callbacks.onLock?.();
     showLocked(true);
@@ -146,6 +150,14 @@ const RankMeAuth = (() => {
     await request('/api/auth/enroll/verify','POST',{credential:credentialJSON(credential)});
     await unlock();
   }
+  async function acceptInvite(name) {
+    if (!supported()) throw Error('Passkeys unavailable');
+    if (!invite) throw Error('Invitation unavailable');
+    const options = await request('/api/auth/invite/options','POST',{invite_secret:invite,name:String(name || '').trim()});
+    const credential = await navigator.credentials.create({publicKey:creationOptions(options.publicKey)});
+    await request('/api/auth/invite/verify','POST',{invite_secret:invite,credential:credentialJSON(credential)});
+    await unlock();
+  }
   async function stepUp() {
     if (!supported()) throw Error('Passkeys unavailable');
     const options = await request('/api/auth/step-up/options','POST',{});
@@ -174,7 +186,7 @@ const RankMeAuth = (() => {
     showLocked(true);
     try {
       const result = await status();
-      if (result.authenticated) await unlock();
+      if (result.authenticated && !invite) await unlock();
       else showLocked(result.enrolled);
     } catch {
       showError('RankMe is unavailable. Check your connection and reload this page.');
@@ -186,6 +198,9 @@ const RankMeAuth = (() => {
     const fragment = location.hash;
     if (fragment.startsWith('#bootstrap=')) {
       bootstrap = new URLSearchParams(fragment.slice(1)).get('bootstrap') || '';
+      history.replaceState(null,'',location.pathname + location.search);
+    } else if (fragment.startsWith('#add-passkey=')) {
+      invite = new URLSearchParams(fragment.slice(1)).get('add-passkey') || '';
       history.replaceState(null,'',location.pathname + location.search);
     }
     $('#auth-bootstrap-field').hidden = Boolean(bootstrap);
@@ -209,9 +224,18 @@ const RankMeAuth = (() => {
       }
       finally { button.disabled = false; }
     });
+    $('#auth-invite').addEventListener('submit', async event => {
+      event.preventDefault();
+      const button = event.currentTarget.querySelector('button');
+      button.disabled = true;
+      showError('');
+      try { await acceptInvite($('#auth-invite-name').value); }
+      catch (error) { showError(errorMessage(error)); }
+      finally { button.disabled = false; }
+    });
     try {
       const result = await status();
-      if (result.authenticated) await unlock();
+      if (result.authenticated && !invite) await unlock();
       else showLocked(result.enrolled);
     } catch {
       showLocked(true);

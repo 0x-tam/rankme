@@ -32,6 +32,19 @@ by the page. There is no public signup endpoint or password/email recovery fallb
 Once enrolled, add a backup passkey in Settings. Adding/removing passkeys requires
 fresh passkey verification, and the final passkey cannot be removed.
 
+If the owner is away from a device with an existing passkey, an operator with direct
+database credentials can issue a temporary link for that same owner:
+
+```sh
+node --env-file=.env.local --import tsx scripts/cloud-admin.ts invite-passkey --output /private/path/rankme-passkey-link.txt
+```
+
+Open the link on the new device and select **Add passkey on this device**. The link
+expires after ten minutes and works once; issuing another link immediately revokes
+the previous one. The secret is removed from browser history before the page makes
+a request. This adds a credential to the existing owner and keeps the existing
+passkeys active. Delete the private link file after use.
+
 The local `localhost:8787` workspace has separate passkeys. Use the local launcher's
 explicit `--enroll` flow for local administration; the cloud passkey is scoped to
 `getrankme.vercel.app`. Changing the public domain requires planning new enrollment.

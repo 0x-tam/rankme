@@ -91,8 +91,8 @@ function rejectCrossOriginCeremony(clientData: unknown): void {
 }
 
 type Config = { publicOrigin?: string; cookieSecret?: string };
-type ChallengeKind = 'enroll' | 'login' | 'stepup' | 'add';
-type Challenge = { challenge: string; session_id: string | null; bootstrap_hash: string | null; name: string | null };
+type ChallengeKind = 'enroll' | 'login' | 'stepup' | 'add' | 'invite';
+type Challenge = { challenge: string; session_id: string | null; bootstrap_hash: string | null; invite_hash: string | null; name: string | null };
 
 export function createAuthService(pool: Pool, config: Config = {}) {
   const publicOrigin = config.publicOrigin ?? process.env.RANKME_PUBLIC_ORIGIN ?? 'https://getrankme.vercel.app';
@@ -155,13 +155,13 @@ export function createAuthService(pool: Pool, config: Config = {}) {
     return { token, csrf };
   }
 
-  async function saveChallenge(kind: ChallengeKind, challenge: string, request: Request, sessionId?: string, bootstrapHash?: string, name?: string): Promise<void> {
+  async function saveChallenge(kind: ChallengeKind, challenge: string, request: Request, sessionId?: string, bootstrapHash?: string, name?: string, inviteHash?: string): Promise<void> {
     const browser = browserHash(request);
     await withTransaction(async client => {
       await client.query('DELETE FROM rankme_cloud.challenges WHERE browser_hash=$1 AND kind=$2', [browser, kind]);
-      await client.query(`INSERT INTO rankme_cloud.challenges(id,kind,challenge,browser_hash,session_id,bootstrap_hash,name,expires_at)
-        VALUES($1,$2,$3,$4,$5,$6,$7,now()+interval '5 minutes')`,
-        [randomUUID(), kind, challenge, browser, sessionId ?? null, bootstrapHash ?? null, name ?? null]);
+      await client.query(`INSERT INTO rankme_cloud.challenges(id,kind,challenge,browser_hash,session_id,bootstrap_hash,name,invite_hash,expires_at)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,now()+interval '5 minutes')`,
+        [randomUUID(), kind, challenge, browser, sessionId ?? null, bootstrapHash ?? null, name ?? null, inviteHash ?? null]);
     }, pool);
   }
   async function consumeChallenge(kind: ChallengeKind, request: Request, sessionId?: string): Promise<Challenge> {
@@ -169,7 +169,7 @@ export function createAuthService(pool: Pool, config: Config = {}) {
     const result = await pool.query(`DELETE FROM rankme_cloud.challenges WHERE id IN
       (SELECT id FROM rankme_cloud.challenges WHERE kind=$1 AND browser_hash=$2
        AND session_id IS NOT DISTINCT FROM $3::uuid ORDER BY created_at DESC LIMIT 1)
-      RETURNING challenge,session_id,bootstrap_hash,name,expires_at`, [kind, browser, sessionId ?? null]);
+      RETURNING challenge,session_id,bootstrap_hash,invite_hash,name,expires_at`, [kind, browser, sessionId ?? null]);
     const row = result.rows[0];
     if (!row || new Date(row.expires_at).getTime() <= Date.now()) throw new AuthError(403);
     return row;
@@ -180,13 +180,14 @@ export function createAuthService(pool: Pool, config: Config = {}) {
     const pre = existing && /^[A-Za-z0-9_-]{43}$/.test(existing) ? existing : randomToken();
     const session = await requireSession(request);
     const enrolled = (await pool.query('SELECT EXISTS(SELECT 1 FROM rankme_cloud.owner) AS enrolled')).rows[0].enrolled;
-    const response = json({ enrolled, authenticated: Boolean(session), csrf: session?.csrf ?? csrfFor(pre) });
+    const response = json({ enrolled, authenticated: Boolean(session), csrf: session?.csrf ?? csrfFor(pre), preCsrf: csrfFor(pre) });
     if (pre !== existing) response.headers.append('Set-Cookie', setCookie(PRE_COOKIE, pre, 8 * 3600));
     return response;
   }
 
-  async function registrationOptions(request: Request, add: boolean): Promise<Response> {
-    let ownerId: string, userHandle: Uint8Array<ArrayBufferLike>, name = 'Passkey', bootstrapHash: string | undefined;
+  async function registrationOptions(request: Request, mode: 'enroll' | 'add' | 'invite'): Promise<Response> {
+    const add = mode === 'add', invited = mode === 'invite';
+    let ownerId: string, userHandle: Uint8Array<ArrayBufferLike>, name = 'Passkey', bootstrapHash: string | undefined, inviteHash: string | undefined;
     let session: AuthSession | null = null;
     if (add) {
       session = await requireSession(request, true);
@@ -201,6 +202,20 @@ export function createAuthService(pool: Pool, config: Config = {}) {
       if (!owner.rowCount) throw new AuthError(401);
       ownerId = session.ownerId;
       userHandle = Uint8Array.from(owner.rows[0].user_handle);
+    } else if (invited) {
+      mutation(request);
+      const body = await readBody(request);
+      if (typeof body.invite_secret !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(body.invite_secret)) throw new AuthError(403);
+      inviteHash = hash(body.invite_secret);
+      await rate('invite', inviteHash, 10, 600);
+      const result = await pool.query(`SELECT o.id,o.user_handle FROM rankme_cloud.passkey_invites i
+        JOIN rankme_cloud.owner o ON o.id=i.owner_id WHERE i.secret_hash=$1 AND i.expires_at>now()`, [inviteHash]);
+      if (result.rowCount !== 1) throw new AuthError(403);
+      ownerId = result.rows[0].id;
+      userHandle = Uint8Array.from(result.rows[0].user_handle);
+      const count = await pool.query('SELECT count(*)::int AS count FROM rankme_cloud.credentials WHERE owner_id=$1', [ownerId]);
+      if (count.rows[0].count >= 10) throw new AuthError(409);
+      name = typeof body.name === 'string' ? body.name.trim().slice(0, 80) || 'Passkey' : 'Passkey';
     } else {
       mutation(request);
       const body = await readBody(request);
@@ -214,21 +229,26 @@ export function createAuthService(pool: Pool, config: Config = {}) {
       ownerId = randomUUID();
       userHandle = randomBytes(32);
     }
-    const creds = add ? await pool.query('SELECT id,transports FROM rankme_cloud.credentials WHERE owner_id=$1', [ownerId]) : { rows: [] };
+    const creds = add || invited ? await pool.query('SELECT id,transports FROM rankme_cloud.credentials WHERE owner_id=$1', [ownerId]) : { rows: [] };
     const publicKey = await generateRegistrationOptions({ rpName: 'RankMe', rpID, userName: 'owner', userDisplayName: 'RankMe owner',
       userID: Uint8Array.from(userHandle) as Uint8Array<ArrayBuffer>, attestationType: 'none', timeout: CHALLENGE_MS,
-      authenticatorSelection: { residentKey: 'required', requireResidentKey: true, userVerification: 'required' },
+      authenticatorSelection: { residentKey: 'required', requireResidentKey: true, userVerification: 'required',
+        ...(invited ? { authenticatorAttachment: 'platform' as const } : {}) },
       excludeCredentials: creds.rows.map(row => ({ id: row.id, transports: row.transports })) });
-    await saveChallenge(add ? 'add' : 'enroll', publicKey.challenge, request, session?.id, bootstrapHash, add ? name : Buffer.from(userHandle).toString('base64url'));
+    await saveChallenge(mode, publicKey.challenge, request, session?.id, bootstrapHash,
+      add || invited ? name : Buffer.from(userHandle).toString('base64url'), inviteHash);
     return json({ publicKey });
   }
 
-  async function registrationVerify(request: Request, add: boolean): Promise<Response> {
+  async function registrationVerify(request: Request, mode: 'enroll' | 'add' | 'invite'): Promise<Response> {
+    const add = mode === 'add', invited = mode === 'invite';
     const session = add ? await requireSession(request, true) : null;
     if (add && !session) throw new AuthError(401);
     if (!add) mutation(request);
     const body = await readBody(request);
-    const challenge = await consumeChallenge(add ? 'add' : 'enroll', request, session?.id);
+    const challenge = await consumeChallenge(mode, request, session?.id);
+    if (invited && (typeof body.invite_secret !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(body.invite_secret) ||
+      !challenge.invite_hash || !safeEqual(hash(body.invite_secret), challenge.invite_hash))) throw new AuthError(403);
     if (!body.credential || typeof body.credential !== 'object') throw new AuthError(400);
     rejectCrossOriginCeremony((body.credential as RegistrationResponseJSON).response?.clientDataJSON);
     let verified;
@@ -245,6 +265,8 @@ export function createAuthService(pool: Pool, config: Config = {}) {
           AND step_up_at>now()-interval '5 minutes' AND absolute_expires_at>now() AND idle_expires_at>now()
           RETURNING owner_id`, [session!.id]);
         if (!stepped.rowCount) throw new AuthError(403);
+        const owner = await client.query('SELECT id FROM rankme_cloud.owner WHERE id=$1 FOR UPDATE', [session!.ownerId]);
+        if (!owner.rowCount) throw new AuthError(401);
         const count = await client.query('SELECT count(*)::int AS count FROM rankme_cloud.credentials WHERE owner_id=$1', [session!.ownerId]);
         if (count.rows[0].count >= 10) throw new AuthError(409);
         await client.query(`INSERT INTO rankme_cloud.credentials(id,owner_id,name,public_key,counter,transports)
@@ -252,6 +274,27 @@ export function createAuthService(pool: Pool, config: Config = {}) {
           Buffer.from(credential.publicKey), credential.counter, transports]);
       }, pool);
       return json({ id: credential.id, name: challenge.name ?? 'Passkey' });
+    }
+    if (invited) {
+      const issued = await withTransaction(async client => {
+        await client.query('SELECT pg_advisory_xact_lock($1)', [72149304]);
+        const invite = await client.query(`DELETE FROM rankme_cloud.passkey_invites WHERE secret_hash=$1 AND expires_at>now()
+          RETURNING owner_id`, [challenge.invite_hash]);
+        if (invite.rowCount !== 1) throw new AuthError(403);
+        const ownerId = invite.rows[0].owner_id;
+        const owner = await client.query('SELECT id FROM rankme_cloud.owner WHERE id=$1 FOR UPDATE', [ownerId]);
+        if (!owner.rowCount) throw new AuthError(403);
+        const count = await client.query('SELECT count(*)::int AS count FROM rankme_cloud.credentials WHERE owner_id=$1', [ownerId]);
+        if (count.rows[0].count >= 10) throw new AuthError(409);
+        await client.query(`INSERT INTO rankme_cloud.credentials(id,owner_id,name,public_key,counter,transports)
+          VALUES($1,$2,$3,$4,$5,$6)`, [credential.id, ownerId, challenge.name ?? 'Passkey',
+          Buffer.from(credential.publicKey), credential.counter, transports]);
+        await client.query('DELETE FROM rankme_cloud.challenges WHERE kind=$1 AND invite_hash=$2', ['invite', challenge.invite_hash]);
+        return issueSession(client, ownerId, credential.id);
+      }, pool);
+      const result = json({ verified: true, csrf: issued.csrf, id: credential.id });
+      result.headers.append('Set-Cookie', setCookie(SESSION_COOKIE, issued.token, 8 * 3600));
+      return result;
     }
     const issued = await withTransaction(async client => {
       await client.query('SELECT pg_advisory_xact_lock($1)', [72149302]);
@@ -365,15 +408,17 @@ export function createAuthService(pool: Pool, config: Config = {}) {
         if (!session) throw new AuthError(401);
         return json({ csrf: session.csrf, token: session.csrf });
       }
-      if (path === '/api/auth/enroll/options' && request.method === 'POST') return await registrationOptions(request, false);
-      if (path === '/api/auth/enroll/verify' && request.method === 'POST') return await registrationVerify(request, false);
+      if (path === '/api/auth/enroll/options' && request.method === 'POST') return await registrationOptions(request, 'enroll');
+      if (path === '/api/auth/enroll/verify' && request.method === 'POST') return await registrationVerify(request, 'enroll');
+      if (path === '/api/auth/invite/options' && request.method === 'POST') return await registrationOptions(request, 'invite');
+      if (path === '/api/auth/invite/verify' && request.method === 'POST') return await registrationVerify(request, 'invite');
       if (path === '/api/auth/login/options' && request.method === 'POST') return await authenticationOptions(request, 'login');
       if (path === '/api/auth/login/verify' && request.method === 'POST') return await authenticationVerify(request, 'login');
       if (path === '/api/auth/step-up/options' && request.method === 'POST') return await authenticationOptions(request, 'stepup');
       if (path === '/api/auth/step-up/verify' && request.method === 'POST') return await authenticationVerify(request, 'stepup');
       if (path === '/api/auth/credentials' && request.method === 'GET') return await credentials(request);
-      if (path === '/api/auth/credentials/options' && request.method === 'POST') return await registrationOptions(request, true);
-      if (path === '/api/auth/credentials/verify' && request.method === 'POST') return await registrationVerify(request, true);
+      if (path === '/api/auth/credentials/options' && request.method === 'POST') return await registrationOptions(request, 'add');
+      if (path === '/api/auth/credentials/verify' && request.method === 'POST') return await registrationVerify(request, 'add');
       if (path.startsWith('/api/auth/credentials/') && request.method === 'DELETE')
         return await removeCredential(request, decodeURIComponent(path.slice('/api/auth/credentials/'.length)));
       if (path === '/api/auth/logout' && request.method === 'POST') {

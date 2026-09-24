@@ -47,6 +47,7 @@ button:disabled{cursor:not-allowed}
 .auth-card>p#auth-description{font-size:15px;line-height:1.65;color:#66738b;margin:10px 0 26px}
 .auth-button{width:100%;min-height:46px;font-size:14px}
 .auth-card label{font-size:13px}
+.auth-card #auth-invite-name{display:block;width:100%;margin:8px 0 20px}
 .auth-card .hint{font-size:12px;line-height:1.6;margin:9px 0 20px}
 .auth-guidance{border-top:1px solid #e8ecf3;margin-top:28px;padding-top:20px;color:#788397;font-size:12px;line-height:1.65;overflow-wrap:anywhere}
 .auth-guidance strong{color:#52617d;font-weight:600}
