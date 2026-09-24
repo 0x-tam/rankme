@@ -12,6 +12,12 @@ test('cloud mutation allowlist mirrors local worker', () => {
   assert.equal(allowedCommand('POST', `/api/articles/${id}/publish`, { force: true }), false);
   assert.equal(allowedCommand('PATCH', `/api/clients/${id}`, { profile: { nested: { api_key: 'secret' } } }), false);
   assert.equal(allowedCommand('POST', '/api/google/configure', { client_secret: 'secret' }), false);
+  for (const action of ['stop', 'dismiss', 'retry']) assert.equal(allowedCommand('POST', `/api/jobs/${id}/${action}`, {}), true);
+  assert.equal(allowedCommand('POST', `/api/jobs/${id}/stop`, { force: true }), false);
+  for (const action of ['remove', 'remove-cover']) assert.equal(allowedCommand('POST', `/api/articles/${id}/${action}`, {}), true);
+  assert.equal(allowedCommand('POST', `/api/clients/${id}/remove`, { confirm: 'eoncoatings.com' }), true);
+  assert.equal(allowedCommand('POST', `/api/clients/${id}/remove`, {}), false);
+  assert.equal(allowedCommand('POST', `/api/clients/${id}/remove`, { confirm: 'x.com', extra: 1 }), false);
 });
 
 test('worker endpoints reject missing bearer before database access', async () => {

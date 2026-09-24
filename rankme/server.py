@@ -112,7 +112,14 @@ class Application:
                 fields["seo_attempt_at"] = ""
         if "image_brand" in data:
             from .brand import normalize_brand
-            fields["image_brand"] = normalize_brand(data["image_brand"])
+            brand = normalize_brand(data["image_brand"])
+            previous = client.get("image_brand") or {}
+            # Learned references only stay valid while the rendering mode stays the same.
+            if previous.get("mode", "illustration_3d") == brand.get("mode", "illustration_3d"):
+                brand.update({k: previous[k] for k in ("references", "style_spec") if previous.get(k)})
+            if previous.get("site"):
+                brand["site"] = previous["site"]  # The brand website guide is managed by its own endpoint and job.
+            fields["image_brand"] = brand
         if "profile" in data:
             if not isinstance(data["profile"], dict):
                 raise ValueError("Business profile must be an object")
@@ -128,7 +135,8 @@ class Application:
             if not isinstance(data["connection"], dict):
                 raise ValueError("Publishing connection must be an object")
             from .publisher import validate_connection
-            connection = {**client.get("connection", {}), **data["connection"]}
+            managed = ("provider", "vercel", "deploy_on_publish")
+            connection = {**client.get("connection", {}), **{k: v for k, v in data["connection"].items() if k not in managed}}
             if connection.get("project_path"):
                 checked = validate_connection(connection)
                 if not checked["ok"]:
@@ -167,6 +175,187 @@ class Application:
         self.engine.wake.set()
         return result
 
+    def link_vercel(self, ident, data):
+        """Connect one website to a Vercel project and prepare RankMe's own copy of its repository."""
+        from .publisher import validate_connection
+        from .store import now
+        from .vercel import github_access, readiness, sync_site
+        client = self.store.get("clients", ident)
+        if self.busy(ident):
+            raise ValueError("Wait for this website's current job to finish")
+        project = self.engine.vercel.project(str(data.get("team_id", "")), str(data.get("project_id", "")))
+        if not project["repo"]:
+            raise ValueError("This Vercel project is not linked to a GitHub repository. Connect it in Vercel under Project → Settings → Git.")
+        access = github_access(project["repo"])
+        if not access["ok"]:
+            raise ValueError(access["message"])
+        path = sync_site(self.data_dir, ident, project["repo"], project["branch"])
+        ready = readiness(path)
+        domains = [d for d in project["domains"] if re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", d)]
+        domain = str(data.get("domain") or "").strip().lower()
+        if domain not in domains:
+            domain = domains[0] if domains else ""
+        if not domain:
+            raise ValueError("This Vercel project has no domain. Add one in Vercel first.")
+        blog_path = "/" + str(data.get("blog_path") or "blog").strip().strip("/")
+        if not re.fullmatch(r"(?:/[a-z0-9-]+)+", blog_path):
+            raise ValueError("Blog path must look like /blog or /resources/articles")
+        content_dir = str(data.get("content_dir") or ready["content_dir"] or "content/blog").strip().strip("/")
+        previous = client.get("connection", {})
+        connection = {**previous, "provider": "vercel", "mode": "git", "project_path": str(path), "branch": project["branch"],
+                      "remote": "origin", "content_dir": content_dir, "format": previous.get("format") or "md",
+                      "build_command": [], "deploy_command": [], "public_url_template": f"https://{domain}{blog_path}/{{slug}}",
+                      "deploy_on_publish": True, "auto_publish": bool(previous.get("auto_publish")) and previous.get("provider") == "vercel",
+                      "vercel": {"team_id": project["team_id"], "project_id": project["id"], "name": project["name"], "repo": project["repo"],
+                                 "branch": project["branch"], "domain": domain, "domains": domains[:20], "framework": ready["framework"],
+                                 "readiness": ready, "checked_at": now()}}
+        checked = validate_connection(connection)
+        if not checked["ok"]:
+            raise ValueError(checked["message"])
+        with self.engine.guard:
+            if self.busy(ident):
+                raise ValueError("Wait for this website's current job to finish")
+            result = self.store.update("clients", ident, connection=connection)
+        self.store.event(f"Connected to Vercel project {project['name']} ({project['repo']})", ident)
+        return result
+
+    def check_vercel(self, ident):
+        from .store import now
+        from .vercel import readiness, sync_site
+        client = self.store.get("clients", ident)
+        connection = client.get("connection", {})
+        if connection.get("provider") != "vercel":
+            raise ValueError("This website is not connected to Vercel")
+        if self.busy(ident):
+            raise ValueError("Wait for this website's current job to finish")
+        link = connection["vercel"]
+        path = sync_site(self.data_dir, ident, link["repo"], connection["branch"])
+        link = {**link, "readiness": readiness(path), "checked_at": now()}
+        with self.engine.guard:
+            return self.store.update("clients", ident, connection={**connection, "vercel": link})
+
+    def unlink_vercel(self, ident):
+        client = self.store.get("clients", ident)
+        with self.engine.guard:
+            if self.busy(ident):
+                raise ValueError("Wait for this website's current job to finish")
+            # RankMe's repository copy stays on disk so reconnecting is fast; nothing is deleted remotely.
+            connection = {"mode": "export", "format": client.get("connection", {}).get("format", "md"), "content_dir": "content/blog",
+                          "auto_publish": False, "remote": "origin", "branch": "", "project_path": "", "build_command": [],
+                          "deploy_command": [], "public_url_template": ""}
+            result = self.store.update("clients", ident, connection=connection)
+        self.store.event("Disconnected the Vercel project", ident)
+        return result
+
+    def _drop_cover_files(self, article, client):
+        """Delete an article's cover files and forget it as a style reference."""
+        import shutil
+        folder = self.data_dir.resolve() / "covers" / article["id"]
+        if re.fullmatch(r"[a-zA-Z0-9_-]{1,100}", article["id"]) and not folder.is_symlink() and folder.resolve().parent == self.data_dir.resolve() / "covers":
+            shutil.rmtree(folder, ignore_errors=True)
+        brand = client.get("image_brand") or {}
+        if any(r.get("article_id") == article["id"] for r in brand.get("references", [])):
+            references = [r for r in brand["references"] if r.get("article_id") != article["id"]]
+            brand = {k: v for k, v in {**brand, "references": references}.items() if k != "style_spec"}
+            self.store.update("clients", client["id"], image_brand=brand)
+
+    def remove_article(self, article):
+        """Delete one article from RankMe. A published copy on the live website is not touched."""
+        import shutil
+        with self.engine.guard:
+            if any(j.get("article_id") == article["id"] and j["status"] in ("queued", "running") for j in self.store.all("jobs")):
+                raise ValueError("Stop this article's current job before deleting it")
+            if any(a.get("refresh_of") == article["id"] for a in self.store.all("articles")):
+                raise ValueError("Delete this article's refresh draft first")
+            client = self.store.get("clients", article["client_id"])
+            self._drop_cover_files(article, client)
+            revisions = self.data_dir.resolve() / "revisions" / article["id"]
+            if re.fullmatch(r"[a-zA-Z0-9_-]{1,100}", article["id"]) and not revisions.is_symlink():
+                shutil.rmtree(revisions, ignore_errors=True)
+            self.store.delete("articles", article["id"])
+        live = article.get("status") in ("published", "refreshed", "verification_pending")
+        self.store.event("Deleted article “%s”%s" % (article.get("title", "Untitled"), " (it stays live on the website)" if live else ""), client["id"], "warning")
+        return {"ok": True, "removed": article["id"]}
+
+    def remove_cover(self, article):
+        """Discard an unpublished article's cover; the article waits for a new one before it can publish."""
+        with self.engine.guard:
+            if any(j.get("article_id") == article["id"] and j["status"] in ("queued", "running") for j in self.store.all("jobs")):
+                raise ValueError("Stop this article's current job first")
+            if article.get("publish_started") or article["status"] in ("published", "exported", "verification_pending", "refreshed"):
+                raise ValueError("Published covers are preserved")
+            if not article.get("cover"):
+                raise ValueError("This article has no cover")
+            client = self.store.get("clients", article["client_id"])
+            self._drop_cover_files(article, client)
+            status = "held" if article["status"] == "ready" else article["status"]
+            return self.store.update("articles", article["id"], cover=None, cover_stale=False, status=status)
+
+    def remove_client(self, ident, data):
+        """Permanently remove a website from RankMe. Nothing on the live website, GitHub, or Vercel changes."""
+        import shutil
+        client = self.store.get("clients", ident)
+        host = (urlparse(client["url"]).hostname or "").removeprefix("www.")
+        typed = str(data.get("confirm", "")).strip().lower().removeprefix("https://").removeprefix("http://").removeprefix("www.").rstrip("/")
+        if not host or typed != host:
+            raise ValueError("Type " + host + " to confirm removing this website")
+        with self.engine.guard:
+            if self.busy(ident):
+                raise ValueError("Wait for this website's current job to finish, or pause it, before removing the website")
+            article_ids = [a["id"] for a in self.store.all("articles") if a.get("client_id") == ident]
+            self.store.delete_client(ident)
+        root = self.data_dir.resolve()
+        folders = [root / "brand" / ident, root / "sites" / ident, root / "exports" / ident]
+        folders += [root / kind / article for article in article_ids for kind in ("covers", "revisions")]
+        for folder in folders:
+            # Only RankMe-owned folders inside the data directory; never follow a symbolic link out of it.
+            if re.fullmatch(r"[a-zA-Z0-9_-]{1,100}", folder.name) and not folder.is_symlink() and root in folder.resolve().parents:
+                shutil.rmtree(folder, ignore_errors=True)
+        self.store.event("Removed website " + (client.get("name") or host) + " and its RankMe data", None, "warning")
+        return {"ok": True, "removed": ident}
+
+    def brand_guide(self, ident, data):
+        """Set the brand reference website for covers and queue a scan of its imagery and colors."""
+        from .crawler import normalize_url
+        client = self.store.get("clients", ident)
+        url = normalize_url(str(data.get("url") or client["url"]).strip())
+        parsed = urlparse(url)
+        if (parsed.scheme not in ("http", "https") or not re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", parsed.hostname or "")
+                or parsed.username or parsed.password):
+            raise ValueError("Enter the public website address, such as https://example.com")
+        with self.engine.guard:
+            if self.busy(ident):
+                raise ValueError("Wait for this website's current job to finish")
+            brand = dict(client.get("image_brand") or {})
+            previous = brand.get("site") or {}
+            # A different website starts a fresh guide; rescanning the same one keeps the current guide until the new one is ready.
+            brand["site"] = {**previous, "url": url} if previous.get("url") == url else {"url": url}
+            self.store.update("clients", ident, image_brand=brand)
+            return self.engine.queue("brand-guide", ident)
+
+    def style_reference(self, article, use):
+        """Add or remove an approved cover as one of its website's style references (at most three, newest kept)."""
+        from .covers import MAX_REFERENCES, cover_mode
+        client = self.store.get("clients", article["client_id"])
+        with self.engine.guard:
+            if self.busy(client["id"]):
+                raise ValueError("Wait for this website's current job to finish")
+            brand = dict(client.get("image_brand") or {})
+            cover = article.get("cover") or {}
+            references = [r for r in brand.get("references", []) if r.get("article_id") != article["id"]]
+            if use:
+                if not cover.get("review", {}).get("passed") or not self.engine.cover_valid(client, article):
+                    raise ValueError("Only a cover that passed review can become a style reference")
+                if cover.get("mode", "illustration_3d") != cover_mode(client):
+                    raise ValueError("This cover was made in a different style than the website now uses")
+                references = (references + [{"article_id": article["id"], "sha256": cover["sha256"]}])[-MAX_REFERENCES:]
+            brand["references"] = references
+            brand.pop("style_spec", None)
+            result = self.store.update("clients", client["id"], image_brand=brand)
+            if references:
+                self.engine.queue("style", client["id"])
+        return result
+
     def dispatch(self, method, path, data):
         parts = path.strip("/").split("/")
         if method == "GET" and path == "/api/state":
@@ -196,6 +385,22 @@ class Application:
                 return google.disconnect()
             if method == "GET" and path == "/api/google/properties":
                 return google.properties()
+        if path.startswith("/api/vercel/"):
+            vercel = self.engine.vercel
+            if method == "POST" and path == "/api/vercel/connect":
+                return vercel.connect(str(data.get("token", "")))
+            if method == "POST" and path == "/api/vercel/disconnect":
+                return vercel.disconnect()
+            if method == "GET" and path == "/api/vercel/projects":
+                return vercel.projects()
+        if method == "POST" and len(parts) in (4, 5) and parts[:2] == ["api", "clients"] and parts[3] == "vercel":
+            action = parts[4] if len(parts) == 5 else "link"
+            if action == "link":
+                return self.link_vercel(parts[2], data)
+            if action == "check":
+                return self.check_vercel(parts[2])
+            if action == "unlink":
+                return self.unlink_vercel(parts[2])
         if len(parts) >= 3 and parts[:2] == ["api", "backlinks"]:
             link = self.store.get("backlinks", parts[2])
             if method == "POST" and len(parts) == 4 and parts[3] == "check":
@@ -258,6 +463,10 @@ class Application:
                         if self.busy(ident):
                             raise ValueError("Wait for this client's current job before recording a page change")
                         return start(self.engine, ident, data.get("page_url", ""), data.get("hypothesis", ""), data.get("change", ""))
+                if action == "brand-guide":
+                    return self.brand_guide(ident, data)
+                if action == "remove":
+                    return self.remove_client(ident, data)
                 if action in ("visibility-audit", "visibility-research", "visibility-probe"):
                     if action != "visibility-audit" and not client.get("confirmed"):
                         raise ValueError("Confirm the business profile before public research")
@@ -309,10 +518,20 @@ class Application:
                     self.engine._snapshot(article)
                     allowed.update(status="held", reviewed_digest="", cover_stale=bool(article.get("cover")), review={"passed": False, "issues": ["Draft edited. Run review again."], "score": 0})
                 return self.store.update("articles", ident, **allowed)
+            if method == "POST" and len(parts) == 4 and parts[3] == "remove":
+                return self.remove_article(article)
+            if method == "POST" and len(parts) == 4 and parts[3] == "remove-cover":
+                return self.remove_cover(article)
+            if method == "POST" and len(parts) == 4 and parts[3] == "style-reference":
+                return self.style_reference(article, bool(data.get("use")))
             if method == "POST" and len(parts) == 4 and parts[3] in ("generate", "review", "cover", "publish", "verify"):
                 return self.engine.queue(parts[3], article["client_id"], ident)
         if method == "POST" and len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] == "retry":
             return self.engine.retry(parts[2])
+        if method == "POST" and len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] == "stop":
+            return self.engine.stop(parts[2])
+        if method == "POST" and len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] == "dismiss":
+            return self.engine.dismiss(parts[2])
         raise KeyError("Endpoint not found")
 
 
@@ -511,6 +730,17 @@ def handler_for(app):
                     return self.send(200, result)
                 if method == "GET" and path == "/api/backup":
                     return self.send(200, app.store.backup(), attachment="rankme-backup.json")
+                brand_image = re.fullmatch(r"/api/clients/([a-zA-Z0-9_-]+)/brand-images/([0-9a-f]{16}\.(?:png|jpg|webp))", path)
+                if method == "GET" and brand_image:
+                    from .brand_guide import image_path
+                    client = app.store.get("clients", brand_image.group(1))
+                    items = ((client.get("image_brand") or {}).get("site") or {}).get("images") or []
+                    item = next((i for i in items if i.get("file") == brand_image.group(2)), None)
+                    image_file = item and image_path(app.data_dir, client["id"], item)
+                    if not image_file:
+                        raise KeyError("Brand image not found")
+                    mime = {"png": "image/png", "jpg": "image/jpeg", "webp": "image/webp"}[image_file.suffix[1:]]
+                    return self.send(200, image_file.read_bytes(), mime)
                 cover_route = re.fullmatch(r"/api/articles/([a-f0-9]+)/cover", path)
                 if method == "GET" and cover_route:
                     article = app.store.get("articles", cover_route.group(1))

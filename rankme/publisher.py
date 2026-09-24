@@ -15,11 +15,11 @@ class PublishError(ValueError):
     pass
 
 
-def _run(argv, cwd, timeout=300):
+def _run(argv, cwd, timeout=300, env=None):
     # Child processes can print credentials in either stream or command arguments.
     # Persist only executable name and exit code, never raw subprocess output.
     try:
-        result = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
         raise PublishError("Command timed out after %s seconds." % timeout) from None
     except OSError:
@@ -111,7 +111,9 @@ def validate_connection(connection):
             _run(['git', 'check-ref-format', '--branch', connection['branch']], root)
             if _run(['git', 'rev-parse', '--show-toplevel'], root) != str(root):
                 raise PublishError('Choose the repository root as the project directory.')
-            if not _argv(connection.get('build_command')):
+            # Vercel builds each push itself and keeps the previous production deployment
+            # live if that build fails, so a local build step is optional there.
+            if not _argv(connection.get('build_command')) and connection.get('provider') != 'vercel':
                 raise PublishError('Git publishing requires a build validation command.')
             remote = connection.get('remote', 'origin')
             if not re.fullmatch(r'[A-Za-z0-9_.-]+', remote) or remote.startswith('-'):
@@ -467,7 +469,9 @@ def publish_article(client, article, progress=None, data_dir=None):
               'message': 'Article saved locally. Deployment is not enabled.'}
     if asset:
         result.update(image_path=str(asset['path']), image_url=asset['public']['url'])
-    if not connection.get('auto_publish'):
+    # auto_publish lets scheduled runs go live unattended; deploy_on_publish lets an
+    # explicit Publish click push while scheduled runs still wait for approval.
+    if not (connection.get('auto_publish') or connection.get('deploy_on_publish')):
         return result
     deploy = _argv(connection.get('deploy_command'))
     if git_mode and not checkpoint.get('pushed'):
@@ -488,6 +492,11 @@ def publish_article(client, article, progress=None, data_dir=None):
     if not git_mode and not deploy:
         return result
     url = connection.get('public_url_template', '').replace('{slug}', article['slug'])
+    if connection.get('provider') == 'vercel':
+        # The push only starts a Vercel build; the verify job follows that deployment.
+        result.update(status='verification_pending', live_url=url or None,
+                      message='Pushed to GitHub. Vercel is building the site; RankMe checks the live page when the build finishes.')
+        return result
     verification = verify_live(url, article['title'])
     result.update(status='published' if verification['ok'] else 'verification_pending', live_url=url or None, message=verification['message'])
     return result

@@ -89,7 +89,7 @@ class AITests(unittest.TestCase):
                 captured.update(args=args, kwargs=kwargs)
                 Path(args[args.index('--output-last-message') + 1]).write_text(json.dumps({'passed': True, 'score': 85, 'issues': [], 'summary': 'Checked'}))
                 return type('Result', (), {'returncode': 0})()
-            with patch('rankme.ai.subprocess.run', side_effect=run), patch.dict('os.environ', {'OPENAI_API_KEY': 'must-not-leak', 'CODEX_API_KEY': 'also-must-not-leak'}): result = runner.run('Review', REVIEW)
+            with patch('rankme.cancel.run', side_effect=run), patch.dict('os.environ', {'OPENAI_API_KEY': 'must-not-leak', 'CODEX_API_KEY': 'also-must-not-leak'}): result = runner.run('Review', REVIEW)
             self.assertTrue(result['passed'])
             self.assertIn('--ignore-user-config', captured['args'])
             self.assertIn('read-only', captured['args'])
@@ -104,7 +104,7 @@ class AITests(unittest.TestCase):
             def run(args, **kwargs):
                 Path(args[args.index('--output-last-message') + 1]).write_text(json.dumps({'passed': True, 'score': 90, 'issues': [], 'summary': 'Claims researched'}))
                 return type('Result', (), {'returncode': 0})()
-            with patch('rankme.ai.subprocess.run', side_effect=run):
+            with patch('rankme.cancel.run', side_effect=run):
                 with self.assertRaisesRegex(AIError, 'without a recorded web research'):
                     runner.run('Review', REVIEW, require_research=True)
 
@@ -117,7 +117,7 @@ class AITests(unittest.TestCase):
                 kwargs['stdout'].flush()
                 Path(args[args.index('--output-last-message') + 1]).write_text(json.dumps({'passed': True, 'score': 90, 'issues': [], 'summary': 'Checked'}))
                 return type('Result', (), {'returncode': 0})()
-            with patch('rankme.ai.subprocess.run', side_effect=run):
+            with patch('rankme.cancel.run', side_effect=run):
                 self.assertTrue(runner.run('Review', REVIEW, require_research=True)['passed'])
 
     def test_private_configuration_not_sent_to_ai(self):
@@ -146,7 +146,7 @@ class AITests(unittest.TestCase):
             def run(args, **kwargs):
                 kwargs['stdout'].write('usage limit reached'); kwargs['stdout'].flush()
                 return type('Result', (), {'returncode': 1})()
-            with patch('rankme.ai.subprocess.run', side_effect=run):
+            with patch('rankme.cancel.run', side_effect=run):
                 with self.assertRaises(AIError) as result: runner.run('Review', REVIEW)
             self.assertTrue(result.exception.retryable)
 

@@ -42,16 +42,20 @@ export function allowedCommand(method: string, path: string, value: unknown): bo
   if (method === 'PATCH' && new RegExp(`^/api/opportunities/${ID}$`).test(path)) return Object.keys(body).length === 1 && ['open', 'dismissed'].includes(String(body.status));
   if (method === 'PATCH' && path === '/api/settings') return fieldsOnly(body, ['paused', 'model', 'max_pages'], true);
   if (method !== 'POST') return false;
+  // Removing a website needs the typed address; the Mac checks it again before deleting anything.
+  if (new RegExp(`^/api/clients/${ID}/remove$`).test(path)) {
+    return Object.keys(body).length === 1 && typeof body.confirm === 'string' && body.confirm.length > 0 && body.confirm.length <= 300;
+  }
   const routes: [RegExp, string[]][] = [
     [new RegExp(`^/api/clients/${ID}/(?:inspect|run|visibility-audit|visibility-research|visibility-probe|seo-sync|backlinks-discover)$`), []],
     [new RegExp(`^/api/clients/${ID}/plan$`), ['subject']],
     [new RegExp(`^/api/clients/${ID}/backlinks$`), ['source_url', 'notes']],
     [new RegExp(`^/api/clients/${ID}/experiments$`), ['page_url', 'hypothesis', 'change']],
-    [new RegExp(`^/api/articles/${ID}/(?:generate|review|cover|publish|verify)$`), []],
+    [new RegExp(`^/api/articles/${ID}/(?:generate|review|cover|publish|verify|remove|remove-cover)$`), []],
     [new RegExp(`^/api/backlinks/${ID}/check$`), []],
     [new RegExp(`^/api/opportunities/${ID}/execute$`), []],
     [new RegExp(`^/api/experiments/${ID}/cancel$`), []],
-    [new RegExp(`^/api/jobs/${ID}/retry$`), []],
+    [new RegExp(`^/api/jobs/${ID}/(?:retry|stop|dismiss)$`), []],
   ];
   return routes.some(([route, fields]) => route.test(path) && fieldsOnly(body, fields));
 }

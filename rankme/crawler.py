@@ -70,8 +70,11 @@ def _addresses(host, port):
     return addresses
 
 
-def fetch_public(url, max_bytes=1500000, allowed_hosts=None):
-    """Fetch HTML/text using DNS-pinned connections and validated redirects."""
+IMAGE_TYPES = ('image/png', 'image/jpeg', 'image/webp')
+
+
+def fetch_public(url, max_bytes=1500000, allowed_hosts=None, image=False):
+    """Fetch HTML/text (or, with image=True, raw PNG/JPEG/WebP bytes) using DNS-pinned connections and validated redirects."""
     url = normalize_url(url)
     if not isinstance(max_bytes, int) or not 1 <= max_bytes <= 10000000:
         raise ValueError('Invalid website response size limit.')
@@ -108,7 +111,7 @@ def fetch_public(url, max_bytes=1500000, allowed_hosts=None):
             connection.sock = sock
             path = urlunsplit(('', '', p.path or '/', p.query, ''))
             connection.request('GET', path, headers={'Host': p.netloc, 'User-Agent': USER_AGENT,
-                                                      'Accept': 'text/html,text/plain,application/xml',
+                                                      'Accept': ', '.join(IMAGE_TYPES) if image else 'text/html,text/plain,application/xml',
                                                       'Accept-Encoding': 'identity'})
             response = connection.getresponse()
             if response.status in (301, 302, 303, 307, 308):
@@ -120,7 +123,9 @@ def fetch_public(url, max_bytes=1500000, allowed_hosts=None):
             if response.status >= 400:
                 raise ValueError('Website returned HTTP %s.' % response.status)
             content_type = response.getheader('Content-Type', '')
-            if content_type and not any(t in content_type.lower() for t in ('text/', 'xml', 'json')):
+            if image and content_type.split(';')[0].strip().lower() not in IMAGE_TYPES:
+                raise ValueError('Unsupported image type.')
+            if not image and content_type and not any(t in content_type.lower() for t in ('text/', 'xml', 'json')):
                 raise ValueError('Unsupported website content type.')
             chunks, size = [], 0
             while True:
@@ -136,6 +141,8 @@ def fetch_public(url, max_bytes=1500000, allowed_hosts=None):
                 if size > max_bytes:
                     raise ValueError('Website response exceeds size limit.')
             data = b''.join(chunks)
+            if image:
+                return {'url': url, 'data': data, 'content_type': content_type, 'status': response.status}
             charset = re.search(r'charset=["\']?([^;\s"\']+)', content_type)
             encoding = charset.group(1) if charset else 'utf-8'
             try:

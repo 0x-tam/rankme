@@ -63,6 +63,11 @@ class BridgeTests(unittest.TestCase):
         ident = "a" * 32
         self.assertTrue(allowed_command("POST", f"/api/articles/{ident}/publish", {}))
         self.assertTrue(allowed_command("PATCH", "/api/settings", {"paused": True}))
+        for action in ("stop", "dismiss", "retry"):
+            self.assertTrue(allowed_command("POST", f"/api/jobs/{ident}/{action}", {}))
+        self.assertFalse(allowed_command("POST", f"/api/jobs/{ident}/stop", {"force": True}))
+        for action in ("remove", "remove-cover"):
+            self.assertTrue(allowed_command("POST", f"/api/articles/{ident}/{action}", {}))
         self.assertFalse(allowed_command("PATCH", "/api/settings", {"codex_path": "/tmp/tool"}))
         self.assertFalse(allowed_command("PATCH", f"/api/clients/{ident}", {"connection": {"deploy_command": ["sh"]}}))
         self.assertFalse(allowed_command("POST", f"/api/articles/{ident}/publish", {"force": True}))

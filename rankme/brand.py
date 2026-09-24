@@ -16,9 +16,19 @@ class Styles(HTMLParser):
             self.links.append(attrs.get('href', ''))
 
 
+# How a website's covers are rendered. Every cover for one website uses the same mode.
+COVER_MODES = ('illustration_3d', 'photo')
+# Plain-language art direction the user writes once per website; reused verbatim for every cover.
+DIRECTION_FIELDS = {'mood': 400, 'subjects': 800, 'avoid': 800}
+
+
 def normalize_brand(value):
+    """Validate user-editable cover style. Learned fields (references, style_spec) are managed by the server."""
     if not isinstance(value, dict):
         raise ValueError('Image brand must contain colors and a style direction')
+    mode = value.get('mode') or 'illustration_3d'
+    if mode not in COVER_MODES:
+        raise ValueError('Choose 3D illustration or realistic photography for covers')
     colors = value.get('colors', [])
     if not isinstance(colors, list) or len(colors) > 6:
         raise ValueError('Choose up to six brand colors')
@@ -31,7 +41,15 @@ def normalize_brand(value):
         color = color.strip().upper()
         if color not in result:
             result.append(color)
-    return {'colors': result, 'style': str(value.get('style', ''))[:1600]}
+    brand = {'colors': result, 'style': str(value.get('style', ''))[:1600]}
+    # Omit defaults so existing brands keep their identity (and their reviewed-cover digests).
+    if mode != 'illustration_3d':
+        brand['mode'] = mode
+    for key, limit in DIRECTION_FIELDS.items():
+        text = ' '.join(str(value.get(key) or '').split())[:limit]
+        if text:
+            brand[key] = text
+    return brand
 
 
 def extract_brand(url):

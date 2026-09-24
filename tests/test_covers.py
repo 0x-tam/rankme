@@ -72,7 +72,7 @@ class CoverTests(unittest.TestCase):
     def test_visual_pass_saves_verified_cover(self):
         with tempfile.TemporaryDirectory() as temp:
             calls=[]
-            def job(runner,prompt,schema,work_dir,image=None):
+            def job(runner,prompt,schema,work_dir,image=None,references=()):
                 calls.append(image)
                 if image:return {'passed':True,'issues':[],'summary':'Natural photo'},''
                 return {'image_path':str(png(Path(work_dir)/'image.png')),'alt':'Illustrative dental still life'},''
@@ -84,7 +84,7 @@ class CoverTests(unittest.TestCase):
     def test_failed_visual_review_repairs_once_then_holds(self):
         with tempfile.TemporaryDirectory() as temp:
             calls=[]
-            def job(runner,prompt,schema,work_dir,image=None):
+            def job(runner,prompt,schema,work_dir,image=None,references=()):
                 calls.append(image)
                 if image:return {'passed':False,'issues':['Distorted object'],'summary':'Fix'},''
                 return {'image_path':str(png(Path(work_dir)/'image.png')),'alt':'Photo'},''
@@ -108,7 +108,7 @@ class CoverTests(unittest.TestCase):
                 captured.update(command=command,kwargs=kwargs)
                 Path(command[command.index('--output-last-message')+1]).write_text(json.dumps({'image_path':'','alt':'Not generated'}))
                 return type('Result',(),{'returncode':0})()
-            with patch('rankme.covers.subprocess.run',side_effect=run):_run_image_job(Runner(temp),'Inspect image',GENERATED,temp,image=image)
+            with patch('rankme.cancel.run',side_effect=run):_run_image_job(Runner(temp),'Inspect image',GENERATED,temp,image=image)
             self.assertIn('features.shell_tool=false',captured['command'])
             self.assertIn('features.image_generation=false',captured['command'])
             self.assertIn('-i',captured['command']);self.assertIn('read-only',captured['command'])
@@ -118,7 +118,7 @@ class CoverTests(unittest.TestCase):
             def run(command,**kwargs):
                 kwargs['stdout'].write('usage limit reached');kwargs['stdout'].flush()
                 return type('Result',(),{'returncode':1})()
-            with patch('rankme.covers.subprocess.run',side_effect=run):
+            with patch('rankme.cancel.run',side_effect=run):
                 with self.assertRaises(AIError) as result:_run_image_job(Runner(temp),'Generate',GENERATED,temp)
             self.assertTrue(result.exception.retryable)
 
