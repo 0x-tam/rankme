@@ -64,6 +64,13 @@ class Application:
         if self.busy(ident) and any(k != "automation" for k in data) and not visibility_pause:
             raise ValueError("Wait for the current job to finish before changing this client")
         fields = {}
+        if "conversion_goal" in data:
+            from .experiments import validate_goal
+            fields["conversion_goal"] = validate_goal(data["conversion_goal"], client["url"])
+        if "conversion_goal" in data or "seo_connection" in data:
+            from .measurement import active_for
+            if active_for(self.store, ident):
+                raise ValueError("Finish or cancel active experiments before changing their goal or Google property")
         if "visibility_settings" in data:
             from .autopilot import settings
             value = data["visibility_settings"]
@@ -126,6 +133,13 @@ class Application:
         elif fields.get("confirmed"):
             fields["status"] = "active" if client.get("automation") else "ready"
         result = self.store.update("clients", ident, **fields)
+        if "conversion_goal" in fields:
+            from .measurement import observation
+            self.store.put("measurements", observation(ident, "goal", {"previous": client.get("conversion_goal"),
+                "current": fields["conversion_goal"]}))
+        if "conversion_goal" in fields or "seo_connection" in fields:
+            from .autopilot import rebuild
+            rebuild(self.engine, ident)
         if "image_brand" in fields and brand_digest(client) != brand_digest(result):
             for article in self.engine.articles(ident):
                 if article.get("cover") and not article.get("publish_started"):
@@ -145,6 +159,9 @@ class Application:
             return {"token": self.token}
         if method == "GET" and path == "/api/state":
             return self.engine.state()
+        if method == "POST" and len(parts) == 4 and parts[:2] == ["api", "experiments"] and parts[3] == "cancel":
+            from .measurement import cancel
+            return cancel(self.engine, parts[2])
         if len(parts) >= 3 and parts[:2] == ["api", "opportunities"]:
             from .autopilot import queue_action
             with self.engine.guard:
@@ -211,12 +228,24 @@ class Application:
             if method == "GET" and len(parts) == 4 and parts[3] == "visibility-report":
                 report = self.store.get("visibility", ident)
                 return {**report, "opportunities": [o for o in self.store.all("opportunities") if o["client_id"] == ident],
-                        "tasks": [t for t in self.store.all("tasks") if t["client_id"] == ident]}
+                        "tasks": [t for t in self.store.all("tasks") if t["client_id"] == ident],
+                        "measurements": self.store.history(ident),
+                        "experiments": [r for r in self.store.all("experiments") if r["client_id"] == ident]}
+            if method == "GET" and len(parts) == 4 and parts[3] == "measurement-history":
+                self.store.get("clients", ident)
+                return {"measurements": self.store.history(ident),
+                        "experiments": [r for r in self.store.all("experiments") if r["client_id"] == ident]}
             if method == "PATCH" and len(parts) == 3:
                 return self.update_client(ident, data)
             if method == "POST" and len(parts) == 4:
                 action = parts[3]
                 client = self.store.get("clients", ident)
+                if action == "experiments":
+                    from .measurement import start
+                    with self.engine.guard:
+                        if self.busy(ident):
+                            raise ValueError("Wait for this client's current job before recording a page change")
+                        return start(self.engine, ident, data.get("page_url", ""), data.get("hypothesis", ""), data.get("change", ""))
                 if action in ("visibility-audit", "visibility-research", "visibility-probe"):
                     if action != "visibility-audit" and not client.get("confirmed"):
                         raise ValueError("Confirm the business profile before public research")

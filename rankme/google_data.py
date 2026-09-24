@@ -106,6 +106,38 @@ def _number(value):
         return 0.0
 
 
+def validate_goal(goal, site_url):
+    """Validate an explicit event and a same-site landing URL; never infer goals."""
+    if goal is None or goal == {}:
+        return None
+    if not isinstance(goal, dict) or set(goal) != {'event_name', 'landing_page', 'goal_type'}:
+        raise GoogleDataError('Conversion goal requires event_name, landing_page and goal_type.')
+    event, landing, kind = (goal[key] for key in ('event_name', 'landing_page', 'goal_type'))
+    if not isinstance(event, str) or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,39}', event):
+        raise GoogleDataError('Enter a GA4 event name of at most 40 letters, numbers or underscores, beginning with a letter.')
+    if kind not in ('signup', 'purchase', 'booking', 'lead'):
+        raise GoogleDataError('Choose signup, purchase, booking or lead as the conversion goal type.')
+    if not isinstance(landing, str) or len(landing) > 2048 or not landing.startswith(('https://', 'http://')):
+        raise GoogleDataError('Conversion landing page must be an absolute HTTP(S) website URL, at most 2048 characters.')
+    from .crawler import normalize_url
+    try:
+        parsed = urlsplit(landing)
+        if parsed.fragment:
+            raise ValueError()
+        landing = normalize_url(landing)
+        host = urlsplit(landing).hostname
+        if str(site_url).startswith('sc-domain:'):
+            domain = str(site_url)[10:].lower().rstrip('.')
+            matches = host == domain or host.endswith('.' + domain)
+        else:
+            matches = host.removeprefix('www.') == (urlsplit(site_url).hostname or '').removeprefix('www.')
+        if not matches:
+            raise ValueError()
+    except (ValueError, UnicodeError):
+        raise GoogleDataError('Conversion landing page must be a public URL on the selected website without credentials or fragments.') from None
+    return {'event_name': event, 'landing_page': landing, 'goal_type': kind}
+
+
 class GoogleData:
     def __init__(self, data_dir):
         self.root = Path(data_dir).resolve()
@@ -362,7 +394,41 @@ class GoogleData:
                 'metadata': response.get('metadata', {}),
                 'note': 'Key events recorded in Organic Search sessions, not proof that content caused the conversion.'}
 
-    def sync(self, site_url, ga4_property=''):
+    def _conversion_period(self, property_id, period, goal):
+        page = urlsplit(goal['landing_page'])
+        landing = page.path + ('?' + page.query if page.query else '')
+        def exact(field, value):
+            return {'filter': {'fieldName': field, 'stringFilter':
+                    {'matchType': 'EXACT', 'value': value, 'caseSensitive': True}}}
+        filters = [exact('sessionDefaultChannelGroup', 'Organic Search'), exact('landingPagePlusQueryString', landing),
+                   exact('hostName', page.hostname)]
+        output = {**period, 'landing_page': goal['landing_page'], 'event_name': goal['event_name']}
+        metadata = {}
+        # Event filtering must not restrict the organic-session denominator.
+        for metric, field, event_filter in (('sessions', 'organic_sessions', False), ('eventCount', 'conversions', True)):
+            response = self._api('https://analyticsdata.googleapis.com/v1beta/properties/' + property_id + ':runReport', ANALYTICS_SCOPE,
+                {'dateRanges': [{'startDate': period['start'], 'endDate': period['end']}],
+                 'metrics': [{'name': metric}], 'dimensionFilter': {'andGroup': {'expressions':
+                    filters + ([exact('eventName', goal['event_name'])] if event_filter else [])}},
+                 'limit': '1', 'returnPropertyQuota': True})
+            rows = response.get('rows', [])
+            if not isinstance(rows, list) or len(rows) > 1:
+                raise GoogleDataError('Google returned an unexpected conversion report.')
+            if not rows:
+                output[field] = 0.0
+            else:
+                try:
+                    value = float(rows[0]['metricValues'][0]['value'])
+                    if value < 0 or value != value or abs(value) == float('inf'):
+                        raise ValueError()
+                    output[field] = value
+                except (KeyError, IndexError, TypeError, ValueError):
+                    raise GoogleDataError('Google returned an invalid conversion metric.') from None
+            metadata[field] = response.get('metadata', {})
+        output['metadata'] = metadata
+        return output
+
+    def sync(self, site_url, ga4_property='', goal_config=None):
         site_url = str(site_url).strip()
         if site_url.startswith('sc-domain:'):
             if not re.fullmatch(r'sc-domain:[A-Za-z0-9.-]+', site_url):
@@ -374,6 +440,7 @@ class GoogleData:
         property_id = str(ga4_property).removeprefix('properties/').strip()
         if property_id and not re.fullmatch(r'\d{1,30}', property_id):
             raise GoogleDataError('GA4 property ID must be numeric.')
+        goal = validate_goal(goal_config, site_url)
         today = datetime.now(timezone.utc).date()
         end = today - timedelta(days=3)
         start = end - timedelta(days=27)
@@ -385,6 +452,10 @@ class GoogleData:
                   'notes': ['Windows end three days ago to reduce incomplete-data effects; Google may still revise data.',
                             'Search Console uses Pacific dates; GA4 uses the property time zone. Cross-product totals are not directly comparable.',
                             'Query and page lists are top rows, may omit anonymized queries, and must not be summed as site totals.']}
+        measurement = {'status': 'unconfigured', 'goal': goal, 'current': None, 'previous': None,
+                       'tracking_status': 'unknown', 'issues': [],
+                       'note': 'Conversions are occurrences of the selected event on the selected hostname in Organic Search sessions with the selected landing path and query. Cross-domain events on other hosts are excluded. They are not unique customers or converting sessions and do not prove content caused a conversion. Zero observed events does not establish whether tracking is installed correctly; verify instrumentation separately.'}
+        result['conversion_measurement'] = measurement
         if self.status()['search_console']:
             search = {'limited': False}
             try:
@@ -413,7 +484,18 @@ class GoogleData:
                 result['analytics'] = {name: self._analytics(property_id, period) for name, period in periods.items()}
             except GoogleDataError as exc:
                 result['issues'].append(str(exc))
-        if result['search_console'] is None and result['analytics'] is None:
+        if goal:
+            measurement['status'] = 'unavailable'
+            if not property_id:
+                measurement['issues'].append('Select a GA4 property to measure the configured event.')
+            else:
+                try:
+                    measured = {name: self._conversion_period(property_id, period, goal) for name, period in periods.items()}
+                    measurement.update(measured, status='measured', tracking_status='observed' if any(p['conversions'] > 0 for p in measured.values()) else 'not_observed')
+                except GoogleDataError as exc:
+                    measurement['issues'].append(str(exc))
+            result['issues'].extend(measurement['issues'])
+        if result['search_console'] is None and result['analytics'] is None and measurement['status'] != 'measured':
             raise GoogleDataError('Google sync failed; previous data was preserved. ' + ' '.join(result['issues'][:2]), retryable=True)
         search = result['search_console']
         if search:

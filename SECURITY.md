@@ -25,3 +25,8 @@ No outreach transport, paid-link acquisition, broad link-exchange network, produ
 ## Relevant tests
 
 `tests/test_security_hardening.py`, `tests/test_research.py`, `tests/test_oauth_http.py`, `tests/test_publisher.py`, `tests/test_refresh_publisher.py`, `tests/test_autopilot.py`, `tests/test_visibility_research.py`, and `tests/test_answer_probes.py` cover these boundaries with controlled fixtures. This is regression testing and code review, not an independent penetration-test certification.
+## Measurement history
+
+Conversion goals accept a bounded GA4 event name and a validated same-site public URL. Read-only Google access is reused; no analytics write permission or new credential is introduced. History stores aggregate measurements, public research/answers, and change evidence in the local database. It does not store OAuth tokens or attempt to collect individual visitor identifiers. History and backups can contain business-sensitive information and retain it until the local data is removed; this feature adds no at-rest encryption.
+
+The application rejects measurement updates and preserves the original record when an observation ID is retried. Latest-provider snapshots and their first history write share a database transaction. Experiment baselines are frozen; changed goal/property evidence cannot silently replace them. The normal loopback request protections apply to goal/experiment mutations and history downloads. This is a local single-user boundary, not tenant isolation or a tamper-proof external audit log.

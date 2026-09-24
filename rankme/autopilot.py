@@ -102,6 +102,11 @@ def _rebuild(engine, client_id):
                           "limitations": research.get("limitations", []), "rejected": research.get("rejected", 0)}
     report["crawl_observed_at"] = client.get("crawl_observed_at")
     report["automation"] = settings(client.get("visibility_settings"))
+    from .experiments import enrich_opportunities
+    from .measurement import matching_measurement, active_for
+    conversion = matching_measurement(client, _optional(store, "seo", client_id))
+    report["conversion_measurement"] = conversion
+    report["opportunities"] = enrich_opportunities(report["opportunities"], client.get("conversion_goal"), conversion)
     existing = {o["id"]: o for o in store.all("opportunities") if o["client_id"] == client_id}
     records, active = [], set()
     timestamp = now()
@@ -129,6 +134,9 @@ def _rebuild(engine, client_id):
             "execution_label": {"refresh": "Prepare safe refresh", "article": "Create content brief", "task": "Prepare action brief"}[mode]}
         if original:
             record["source_article_id"] = original["id"]
+            if active_for(store, client_id, item.get("url")):
+                record.update(executable=False, experiment_hold=True,
+                    execution_label="Observing the current page experiment")
         for key in ("article_id", "task_id", "job_id", "error", "completed_at"):
             if key in previous:
                 record[key] = previous[key]
@@ -155,6 +163,9 @@ def queue_action(engine, ident, scheduled=False):
         if item.get("status") not in ("open", "failed"):
             raise ValueError("This opportunity is already queued, completed, dismissed or resolved")
         client = engine.store.get("clients", item["client_id"])
+        from .measurement import active_for
+        if item.get("execution_mode") == "refresh" and active_for(engine.store, client["id"], item.get("url")):
+            raise ValueError("This page has an active experiment; wait for its observation to finish")
         if not client.get("confirmed"):
             raise ValueError("Confirm the business profile before acting on recommendations")
         job = engine.queue("visibility-action", client["id"], opportunity_id=ident, scheduled=scheduled)
@@ -187,6 +198,9 @@ def execute_action(engine, job, progress):
         return  # A retry after a crash must not create another draft.
     if item.get("status") not in ("queued", "failed", "open"):
         raise ValueError("Opportunity is no longer actionable")
+    from .measurement import active_for
+    if item.get("execution_mode") == "refresh" and active_for(store, client["id"], item.get("url")):
+        raise ValueError("This page has an active experiment; another refresh would confound it")
     if job.get("scheduled"):
         config = settings(client.get("visibility_settings"))
         key = "auto_refresh" if item.get("execution_mode") == "refresh" else "auto_plan"
@@ -211,7 +225,7 @@ def execute_action(engine, job, progress):
             article = {"id": article_id, "client_id": client["id"], "title": item["title"],
                 "keyword": str(query)[:200], "intent": "Answer the verified customer need", "subject": client.get("subject") or str(query)[:200],
                 "angle": (item.get("suggested_action", "") + "\n" + _task_body(item, client))[:12000],
-                "cta_url": client["url"], "status": "planned", "scheduled_at": due.isoformat(), "body": "", "error": "",
+                "cta_url": (client.get("conversion_goal") or {}).get("landing_page") or client["url"], "status": "planned", "scheduled_at": due.isoformat(), "body": "", "error": "",
                 "opportunity_id": item["id"], "visibility_generated": True}
             if item["execution_mode"] == "refresh":
                 original = store.get("articles", item["source_article_id"])
@@ -278,8 +292,11 @@ def schedule(engine):
         if used >= config["max_actions"]:
             continue
         candidates = [o for o in engine.store.all("opportunities") if o["client_id"] == client["id"] and
-                      o.get("status") == "open" and ((o.get("execution_mode") == "article" and config["auto_plan"]) or
+                      o.get("status") == "open" and not o.get("experiment_hold") and ((o.get("execution_mode") == "article" and config["auto_plan"]) or
                       (o.get("execution_mode") == "refresh" and config["auto_refresh"]))]
+        from .measurement import active_for
+        candidates = [o for o in candidates if o.get("execution_mode") != "refresh" or
+                      not active_for(engine.store, client["id"], o.get("url"))]
         if candidates:
             item = max(candidates, key=lambda o: o.get("score", 0))
             queue_action(engine, item["id"], scheduled=True)
@@ -311,14 +328,16 @@ def execute(engine, job, progress):
         if not queries:
             raise ValueError("Choose a subject or sync Search Console before sampling answers")
         result = probe(engine.runner(), client, queries, progress)
-        engine.store.put("answer_probes", {**result, "id": client_id, "client_id": client_id})
+        from .measurement import save_snapshot
+        save_snapshot(engine.store, "answer_probes", client_id, result, job["id"])
     elif job["kind"] == "visibility-research":
         if not client.get("confirmed"):
             raise ValueError("Confirm the business profile before public research")
         engine.store.update("clients", client_id, research_attempt_at=now())
         from .visibility_research import research
         result = research(engine.runner(), client, progress)
-        engine.store.put("research", {**result, "id": client_id, "client_id": client_id})
+        from .measurement import save_snapshot
+        save_snapshot(engine.store, "research", client_id, result, job["id"])
     else:
         engine.store.update("clients", client_id, visibility_attempt_at=now())
         from .crawler import crawl_site

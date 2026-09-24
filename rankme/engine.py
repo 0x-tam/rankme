@@ -55,6 +55,8 @@ class Engine:
         self.stop_event = threading.Event()
         self.wake = threading.Event()
         self.guard = threading.RLock()
+        from .measurement import backfill
+        backfill(self.store)
         self.worker = None
         self.codex_status = {"available": False, "authenticated": False, "method": "", "message": "Checking Codex sign-in…"}
 
@@ -99,6 +101,12 @@ class Engine:
                 article = self.store.get("articles", article_id)
                 if article["client_id"] != client_id:
                     raise ValueError("Article does not belong to this client")
+                if kind in ("generate", "publish") and article.get("refresh_of"):
+                    from .measurement import active_for
+                    original = self.store.get("articles", article["refresh_of"])
+                    page = original.get("publish_result", {}).get("live_url")
+                    if any(r.get("article_id") != article_id for r in active_for(self.store, client_id, page)):
+                        raise ValueError("This page has an active experiment; wait before another refresh")
             if kind == "visibility-action":
                 opportunity = self.store.get("opportunities", extra.get("opportunity_id"))
                 if opportunity["client_id"] != client_id:
@@ -182,6 +190,18 @@ class Engine:
             if any(j["client_id"] == client["id"] and (j["status"] in ("queued", "running") or (j["status"] == "failed" and j["kind"] not in ("seo-sync", "backlinks-discover", "backlink-check", "visibility-audit", "visibility-research", "visibility-action", "visibility-probe"))) for j in self.store.all("jobs")):
                 continue
             planned = [a for a in self.articles(client["id"]) if a["status"] == "planned"]
+            if planned:
+                from .measurement import active_for
+                eligible = []
+                for draft in planned:
+                    if draft.get("refresh_of"):
+                        original = self.store.get("articles", draft["refresh_of"])
+                        if active_for(self.store, client["id"], original.get("publish_result", {}).get("live_url")):
+                            continue
+                    eligible.append(draft)
+                if not eligible:
+                    continue
+                planned = eligible
             try:
                 if planned:
                     if planned[0].get("scheduled_at") and parse_date(planned[0]["scheduled_at"]) > current:
@@ -266,8 +286,12 @@ class Engine:
                 if not connection.get("site_url"):
                     raise ValueError("Select a Search Console property first")
                 progress("Reading Search Console and analytics performance")
-                snapshot = self.google.sync(connection["site_url"], connection.get("ga4_property", ""))
-                self.store.put("seo", {**snapshot, "id": client_id, "client_id": client_id})
+                goal = client.get("conversion_goal") or {}
+                snapshot = self.google.sync(connection["site_url"], connection.get("ga4_property", ""),
+                                            goal_config={k: goal[k] for k in ("event_name", "landing_page", "goal_type") if k in goal})
+                from .measurement import save_snapshot, evaluate_all
+                observed = save_snapshot(self.store, "seo", client_id, snapshot, job["id"])
+                evaluate_all(self, client_id, observed["snapshot"], observed["id"])
                 self.store.update("clients", client_id, seo_error="")
             elif job["kind"] == "backlinks-discover":
                 from .backlinks import discover_prospects
@@ -429,6 +453,10 @@ class Engine:
                 self.store.update("articles", article_id, verification=verified,
                                   publish_result=result, last_verified_at=now(), verification_attempts=article.get("verification_attempts", 0) + 1,
                                   status="published" if verified.get("ok") else "verification_pending")
+                if verified.get("ok"):
+                    self.store.update("articles", article_id, published_at=article.get("published_at") or now())
+                from .measurement import record_publication
+                record_publication(self, client, article, result)
             self.store.update("jobs", job["id"], status="completed", stage="Complete", finished_at=now(), error="")
             if job["kind"] in ("seo-sync", "backlinks-discover", "backlink-check", "inspect"):
                 from .autopilot import rebuild
@@ -501,6 +529,7 @@ class Engine:
 
     def publish(self, client, article, progress):
         from .publisher import publish_article
+        from .measurement import active_for, record_publication
         if not client.get("confirmed") or not article.get("review", {}).get("passed") or article.get("reviewed_digest") != content_digest(article):
             raise ValueError("This article needs a successful review before publishing")
         if article.get("reviewed_profile") != profile_digest(client):
@@ -513,6 +542,9 @@ class Engine:
             if original["client_id"] != client["id"] or original.get("status") not in ("published", "refreshed"):
                 raise ValueError("Refresh source is not a published article for this website")
             existing = [a for a in existing if a["id"] != original["id"]]
+            page = original.get("publish_result", {}).get("live_url")
+            if any(r.get("article_id") != article["id"] for r in active_for(self.store, client["id"], page)):
+                raise ValueError("This page has an active experiment. Finish its observation before another refresh.")
         checks = check_article(article, client, existing)
         if not checks["passed"]:
             raise ValueError("Publication checks failed: " + "; ".join(checks["issues"]))
@@ -522,7 +554,27 @@ class Engine:
             path.mkdir(parents=True, exist_ok=True)
             connection.update(project_path=str(path), content_dir="articles", mode="export", format="md", auto_publish=False, deploy_command=[], build_command=[])
         publish_client = {**client, "connection": connection}
+        if not article.get("change_observation"):
+            from .measurement import matching_measurement
+            try:
+                seo = self.store.get("seo", client["id"])
+            except KeyError:
+                seo = {}
+            article = self.store.update("articles", article["id"], change_observation={
+                "started_at": now(), "snapshot": {"conversion_measurement": matching_measurement(client, seo),
+                    "ga4_property": seo.get("ga4_property")}})
+        else:
+            # A failed build may have rolled back the first attempt. Preserve the
+            # pre-change baseline but exclude days before this later attempt too.
+            article = self.store.update("articles", article["id"], change_observation={
+                **article["change_observation"], "started_at": now()})
         self.store.update("articles", article["id"], status="publishing", publish_started=True, error="")
+        from .measurement import observation
+        self.store.put("measurements", observation(client["id"], "publication_attempt", {
+            "article_id": article["id"], "refresh_of": article.get("refresh_of"),
+            "content_digest": content_digest(article), "baseline": article.get("change_observation"),
+            "note": "Publication started; inspect the later result before assuming the site changed."},
+            article["id"] + ":" + article["change_observation"]["started_at"]))
         progress("Publishing and verifying the article")
         result = publish_article(publish_client, article, progress=progress, data_dir=self.data_dir)
         self.store.update("articles", article["id"], status=result["status"], publish_result=result, error="")
@@ -530,14 +582,24 @@ class Engine:
             self.store.update("articles", article["id"], published_at=article.get("published_at") or now())
         if article.get("refresh_of"):
             self.store.update("articles", article["refresh_of"], status="refreshed", replaced_by=article["id"])
+        record_publication(self, client, article, result)
 
     def state(self):
+        from .measurement import matching_measurement
         articles = self.store.all("articles")
+        clients = self.store.all("clients")
+        seo = self.store.all("seo")
+        by_client = {c["id"]: c for c in clients}
+        seo_by_client = {r["id"]: r for r in seo}
+        visibility = [{**r, "conversion_measurement": matching_measurement(by_client.get(r["client_id"], {}),
+                            seo_by_client.get(r["client_id"], {}))} for r in self.store.all("visibility")]
         jobs = sorted(self.store.all("jobs"), key=lambda j: j["created_at"], reverse=True)[:150]
         events = sorted(self.store.all("events"), key=lambda j: j["created_at"], reverse=True)[:200]
-        return {"clients": self.store.all("clients"), "articles": articles, "jobs": jobs, "events": events,
+        return {"clients": clients, "articles": articles, "jobs": jobs, "events": events,
                 "settings": self.store.settings(), "status": self.codex_status,
-                "google": self.google.status(), "seo": self.store.all("seo"), "backlinks": self.store.all("backlinks"),
-                "visibility": self.store.all("visibility"), "opportunities": self.store.all("opportunities"),
+                "google": self.google.status(), "seo": seo, "backlinks": self.store.all("backlinks"),
+                "visibility": visibility, "opportunities": self.store.all("opportunities"),
                 "tasks": self.store.all("tasks"), "research": self.store.all("research"),
+                "measurements": [r for c in clients for r in self.store.history(c["id"], 20)],
+                "measurement_counts": self.store.history_counts(), "experiments": self.store.all("experiments"),
                 "server": {"version": "1.0.0", "local": True}}
