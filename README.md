@@ -96,6 +96,16 @@ The scheduler avoids a flood of missed articles after a long shutdown. It catche
 
 Changing an article requires another successful review before publication. Keep an eye on the activity history and exception states even after the first client is calibrated. The system can reduce routine intervention; it cannot guarantee factual perfection, search rankings, indexing, leads, or sales.
 
+## Connect a website hosted on Vercel
+
+For websites that Vercel deploys from GitHub, connect Vercel once in **Settings** with an access token from [vercel.com/account/tokens](https://vercel.com/account/tokens). RankMe only reads from Vercel: project list, linked repository, production branch, domains, and deployment status. The token is stored in `data/vercel-secrets.json` with owner-only permissions.
+
+On a website's **Content** tab, choose **Choose Vercel project**. RankMe matches projects to the website's domain, keeps its own copy of the GitHub repository in `data/sites/<client>`, and sets the article folder, branch, and article address. It never uses or changes your own working folders. Pushing uses this Mac's existing GitHub sign-in (`gh auth login`), so no GitHub token is stored.
+
+Reviewed articles wait in **Ready to publish** until you click **Publish**. Publishing commits one article to the production branch and pushes it; RankMe then follows the Vercel deployment for that commit and checks the live page once the build is ready. A failed Vercel build leaves the previous site live and shows as **Vercel build failed** with a link to the deployment. You can switch a website to publish reviewed articles automatically from the same card.
+
+The site itself must have a blog section that reads the article folder and prerenders each article as real HTML. The website card flags a missing blog folder and single-page apps without prerendering; until both are in place, articles reach the repository but are not visible to visitors, crawlers, or RankMe's live check.
+
 ## Connect a coded client website
 
 The publishing connection contains the local website project path, article directory, content format, build command, and optional deployment settings. See [INTEGRATION.md](INTEGRATION.md) for the exact field contract and recovery behavior.
@@ -130,6 +140,13 @@ Publication states have distinct meanings:
 - **Held / Error:** checks or execution need attention.
 
 With no connected project, a manual export saves into the configured data directory. Export alone cannot make content appear on a client website.
+
+## Stop work, delete articles, or remove a website
+
+- **Stop:** queued work and running research, writing, review, cover, and scan jobs show a **Stop** button (on the website page, its article rows, and Activity). Stopping ends the Codex process; a written draft returns to review and an unwritten topic returns to the plan. Stopping a scheduled article moves that website's weekly run to next week. Publishing and live checks cannot be stopped midway.
+- **Dismiss:** a failed job pauses that website's weekly schedule until you **Retry** or **Dismiss** it.
+- **Delete:** the article dialog can delete an article (its draft, cover, and reviews) or just its cover. A published article stays live on the website; RankMe stops tracking it. Published covers cannot be deleted.
+- **Remove a website:** under **Website settings**, type the website's address to confirm. This deletes its profile, articles, covers, reports, measurement history, brand guide, and RankMe's repository copy. The live website, GitHub, and Vercel are not changed. Download a backup first if you may need the data.
 
 ## Stop, restart, or change the port
 
@@ -209,11 +226,20 @@ Connected Google properties now refresh automatically, and the visibility workfl
 
 See [VALIDATION.md](VALIDATION.md) for the real subscription test and automated checks, and [RESEARCH.md](RESEARCH.md) for competitor findings and product rationale.
 
-## Brand-matched 3D article covers
+## Brand-matched article covers
 
-Every new article now receives a generated landscape cover after its text passes review. RankMe uses Codex's built-in image generation with the existing ChatGPT sign-in, followed by a separate visual review of the actual image. No image API key or API fallback is used. Subscription availability and usage limits still apply.
+Every new article receives a generated landscape cover after its text passes review. RankMe uses Codex's built-in image generation with the existing ChatGPT sign-in, followed by a separate visual review of the actual image. No image API key or API fallback is used. Subscription availability and usage limits still apply.
 
-Public CSS color tokens provide initial palette suggestions. Review or edit these in the business profile's **Article cover images** fields; a visual direction records the website’s 3D shapes, materials, mood, and theme. If reliable colors cannot be detected, add them before creating covers. The generator creates polished 3D editorial illustrations using the saved website theme and brand palette. It selects concepts for each article’s audience: mature and reassuring for adult treatment topics, approachable and parent-facing for pediatric care. It avoids fake text, unrelated decorative props, toy-like adult imagery, fabricated staff or patients, and treatment-result claims. Generated scenes are illustrative, not photographs of the client's real premises.
+Each website has one **Cover style**, edited from the card on its Content tab:
+
+- **Rendering:** *3D illustration* (polished 3D artwork in the brand colors, with objects readers recognize) or *Realistic photography* (looks like a professional shoot: real materials, natural light, the customer's problem and its fix). Photography mode names common AI tells (waxy surfaces, halos, warped lines, pseudo-text, malformed hands, CGI sheen), and the reviewer rejects any it can see.
+- **Brand colors, mood, what to show, and what to avoid:** sent word for word with every cover for that website, together with fixed composition rules, so covers read as one series. Public CSS color tokens provide the first palette suggestion.
+- **Brand website guide:** choose **Scan brand website** and enter the site whose look covers must match (for example the live domain). RankMe reads up to four public pages within robots.txt, downloads the site's own photos and artwork (skipping logos, icons, team or staff photos, before/after images, and other domains), reads its CSS brand colors, and asks Codex to write a binding guide: summary, art direction, mood, subjects, what to avoid, colors, and the two or three images that best represent the brand. Those images are attached to every cover generation and review; the reviewer rejects covers that drift from them or reproduce their specific premises, products, or people. The guide fills only settings you have left empty. Change the website or rescan at any time.
+- **Brand colors:** shown as swatches with hex codes; edit them with a color picker or by typing the code.
+- **One distinct image per article:** each prompt lists what earlier covers of the website showed and requires a clearly different scene. After generation, an image fingerprint rejects near-copies of any earlier cover before review (one retry, then the article is held), and the reviewer compares the new cover against recent earlier covers.
+- **Style references:** in an article's Review tab, choose **Use as style reference** on up to three approved covers. They are attached to every new cover and to its review, which rejects covers that would look inconsistent next to them. RankMe also writes a short "learned house style" from the references and adds it to every prompt.
+
+Changing the rendering mode clears the references. Changing colors, direction, audience, or tone marks unpublished covers for regeneration; learned references and the house-style text do not. Covers never imply actual staff, customers, patients, premises, or results, and health topics avoid procedures and before/after claims.
 
 Failed visual checks get one automatic revision and then hold the article. Each cover has descriptive alt text, its prompt, a file hash, and a review result. Changing article content, brand colors, visual direction, audience, or tone requires a new matching cover. Existing unpublished drafts can use **Generate cover**; **Regenerate cover** creates a new version.
 

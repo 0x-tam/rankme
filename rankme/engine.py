@@ -34,7 +34,11 @@ def profile_digest(client):
 
 def brand_digest(client):
     brand = client.get("image_brand") or {}
-    return hashlib.sha256(json.dumps({"colors": brand.get("colors", []), "style": brand.get("style", ""), "audience": client.get("profile", {}).get("audience", ""), "tone": client.get("profile", {}).get("tone", "")}, sort_keys=True).encode()).hexdigest()
+    fields = {"colors": brand.get("colors", []), "style": brand.get("style", ""), "audience": client.get("profile", {}).get("audience", ""), "tone": client.get("profile", {}).get("tone", "")}
+    # Direction fields join the digest only once set, so covers reviewed before they existed stay valid.
+    # Learned consistency aids (references, style_spec) refine the house style without invalidating approved covers.
+    fields.update({key: brand[key] for key in ("mode", "mood", "subjects", "avoid") if brand.get(key)})
+    return hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
 
 
 def safe_error(error):
@@ -51,7 +55,9 @@ class Engine:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.runner_factory = runner_factory
         from .google_data import GoogleData
+        from .vercel import Vercel
         self.google = GoogleData(self.data_dir)
+        self.vercel = Vercel(self.data_dir)
         self.stop_event = threading.Event()
         self.wake = threading.Event()
         self.guard = threading.RLock()
@@ -90,7 +96,7 @@ class Engine:
         threading.Thread(target=self.check_status, name="rankme-codex-status", daemon=True).start()
 
     def queue(self, kind, client_id, article_id=None, **extra):
-        if kind not in ("inspect", "plan", "generate", "review", "cover", "publish", "verify", "seo-sync", "backlinks-discover", "backlink-check", "visibility-audit", "visibility-research", "visibility-action", "visibility-probe"):
+        if kind not in ("inspect", "plan", "generate", "review", "cover", "publish", "verify", "seo-sync", "backlinks-discover", "backlink-check", "visibility-audit", "visibility-research", "visibility-action", "visibility-probe", "style", "brand-guide"):
             raise ValueError("Unknown job type")
         self.store.get("clients", client_id)
         with self.guard:
@@ -124,6 +130,53 @@ class Engine:
             self.store.event(kind.capitalize() + " queued", client_id)
             self.wake.set()
             return job
+
+    STOPPABLE_WHILE_RUNNING = ("inspect", "plan", "generate", "review", "cover", "seo-sync", "backlinks-discover", "backlink-check",
+                               "visibility-audit", "visibility-research", "visibility-action", "visibility-probe", "style", "brand-guide")
+
+    def stop(self, ident):
+        """Stop a queued or running job and return its article or website to a state the user can act on."""
+        from . import cancel
+        with self.guard:
+            job = self.store.get("jobs", ident)
+            if job["status"] == "queued":
+                self.unwind(job)
+                return self.store.get("jobs", ident)
+            if job["status"] != "running":
+                raise ValueError("Only queued or running work can be stopped")
+            if job["kind"] not in self.STOPPABLE_WHILE_RUNNING:
+                raise ValueError("Publishing and live checks cannot be stopped midway. Wait a moment for them to finish.")
+            if not cancel.request():
+                raise ValueError("This article is being published to the live website right now and cannot be stopped safely.")
+            self.store.update("jobs", ident, stage="Stopping…")
+            return self.store.get("jobs", ident)
+
+    def unwind(self, job):
+        """Mark a job stopped and undo the in-progress states it set."""
+        self.store.update("jobs", job["id"], status="cancelled", stage="Stopped by you", finished_at=now(), error="")
+        client = self.store.get("clients", job["client_id"])
+        if job.get("article_id"):
+            try:
+                article = self.store.get("articles", job["article_id"])
+            except KeyError:
+                article = None
+            if article and article["status"] in ("writing", "reviewing", "generating_cover"):
+                # Written drafts wait for review again; unwritten topics return to the plan.
+                self.store.update("articles", article["id"], status="held" if article.get("body") else "planned", error="")
+        if job["kind"] in ("inspect", "plan") and client.get("status") in ("inspecting", "planning", "new"):
+            status = ("active" if client.get("automation") else "ready") if client.get("confirmed") else "needs_confirmation" if client.get("profile") else "new"
+            self.store.update("clients", client["id"], status=status, error="")
+        if job.get("scheduled") and job["kind"] in ("plan", "generate") and client.get("automation"):
+            self.advance(client["id"])  # Otherwise the schedule would restart the same work on its next tick.
+        self.store.event("Stopped: " + job["kind"].replace("-", " "), client["id"], "warning")
+
+    def dismiss(self, ident):
+        """Clear a failed job so it no longer blocks this website's weekly schedule."""
+        with self.guard:
+            job = self.store.get("jobs", ident)
+            if job["status"] != "failed":
+                raise ValueError("Only failed jobs can be dismissed")
+            return self.store.update("jobs", ident, status="dismissed", stage="Dismissed")
 
     def retry(self, ident):
         job = self.store.get("jobs", ident)
@@ -167,10 +220,13 @@ class Engine:
             if article["status"] != "verification_pending" or article.get("verification_attempts", 0) >= 12:
                 continue
             client = self.store.get("clients", article["client_id"])
-            if not client.get("automation"):
+            on_vercel = client.get("connection", {}).get("provider") == "vercel"
+            if not client.get("automation") and not on_vercel:
                 continue
+            if (article.get("publish_result") or {}).get("deployment", {}).get("state") in ("ERROR", "CANCELED"):
+                continue  # A failed build needs the user; rechecking cannot fix it.
             last = article.get("last_verified_at") or article.get("updated_at")
-            if last and (current - parse_date(last)).total_seconds() < 300:
+            if last and (current - parse_date(last)).total_seconds() < (90 if on_vercel else 300):
                 continue
             try:
                 self.queue("verify", client["id"], article["id"])
@@ -187,7 +243,7 @@ class Engine:
                 continue
             if due > current:
                 continue
-            if any(j["client_id"] == client["id"] and (j["status"] in ("queued", "running") or (j["status"] == "failed" and j["kind"] not in ("seo-sync", "backlinks-discover", "backlink-check", "visibility-audit", "visibility-research", "visibility-action", "visibility-probe"))) for j in self.store.all("jobs")):
+            if any(j["client_id"] == client["id"] and (j["status"] in ("queued", "running") or (j["status"] == "failed" and j["kind"] not in ("seo-sync", "backlinks-discover", "backlink-check", "visibility-audit", "visibility-research", "visibility-action", "visibility-probe", "style", "brand-guide"))) for j in self.store.all("jobs")):
                 continue
             planned = [a for a in self.articles(client["id"]) if a["status"] == "planned"]
             if planned:
@@ -270,9 +326,12 @@ class Engine:
             if not current.get("automation") or current.get("status") == "paused" or self.store.settings()["paused"]:
                 self.store.update("jobs", job["id"], status="cancelled", stage="Paused before execution", finished_at=now(), error="")
                 return
+        from . import cancel
+        cancel.reset()
         self.store.update("jobs", job["id"], status="running", started_at=now(), attempts=job.get("attempts", 0) + 1)
 
         def progress(message):
+            cancel.check()  # Every progress step is a safe point to stop at.
             self.store.update("jobs", job["id"], stage=str(message)[:400])
 
         try:
@@ -424,6 +483,35 @@ class Engine:
                         self.publish(latest, article, progress)
                 if job.get("scheduled"):
                     self.advance(client_id)
+            elif job["kind"] == "brand-guide":
+                from .brand_guide import scan
+                from .covers import analyze_brand
+                brand = client.get("image_brand") or {}
+                url = (brand.get("site") or {}).get("url") or client["url"]
+                progress("Scanning " + url + " for brand images and colors")
+                site = scan(url, self.data_dir, client_id, progress)
+                progress("Studying the brand's imagery to build the cover guide")
+                from .brand_guide import image_path
+                images = [image_path(self.data_dir, client_id, item) for item in site["images"]]
+                analysis = analyze_brand(self.runner(), client, [path for path in images if path], site["css_colors"], url)
+                latest = self.store.get("clients", client_id).get("image_brand") or {}
+                guide = {**site, "scanned_at": now(), "analysis": analysis}
+                # The guide fills gaps; anything the user already wrote stays theirs.
+                filled = {key: analysis[key] for key in ("mood", "subjects", "avoid") if analysis.get(key) and not latest.get(key)}
+                if analysis["colors"] and not latest.get("colors"):
+                    filled["colors"] = analysis["colors"]
+                self.store.update("clients", client_id, image_brand={**latest, **filled, "site": guide})
+                self.store.event("Brand guide ready from " + url, client_id)
+            elif job["kind"] == "style":
+                from .covers import describe_style, reference_paths
+                progress("Learning this website's cover style from its approved references")
+                brand = client.get("image_brand") or {}
+                wanted = [r.get("sha256") for r in brand.get("references", [])]
+                spec = describe_style(self.runner(), client, reference_paths(client, self.data_dir))
+                latest = self.store.get("clients", client_id).get("image_brand") or {}
+                # References may change while the job runs; only a spec for the current set is kept.
+                if [r.get("sha256") for r in latest.get("references", [])] == wanted:
+                    self.store.update("clients", client_id, image_brand={**latest, "style_spec": spec})
             elif job["kind"] == "cover":
                 article = self.store.get("articles", article_id)
                 if not client.get("confirmed") or not article.get("body"):
@@ -447,6 +535,23 @@ class Engine:
                 result = article.get("publish_result", {})
                 if not result.get("live_url"):
                     raise ValueError("No live article URL is configured")
+                connection = client.get("connection", {})
+                if connection.get("provider") == "vercel" and result.get("commit"):
+                    link = connection.get("vercel", {})
+                    progress("Checking the Vercel deployment")
+                    deployment = self.vercel.deployment(link.get("team_id", ""), link.get("project_id", ""), result["commit"])
+                    result = {**result, "deployment": deployment or {"state": "WAITING"}}
+                    state = (deployment or {}).get("state", "WAITING")
+                    if state != "READY":
+                        failed = state in ("ERROR", "CANCELED")
+                        message = ("Vercel build failed. Open the deployment in Vercel, fix the site build, redeploy, then check again." if failed
+                                   else "Vercel is building the site." if deployment else "Waiting for Vercel to start the build.")
+                        self.store.update("articles", article_id, publish_result={**result, "message": message}, last_verified_at=now(),
+                                          verification_attempts=article.get("verification_attempts", 0) + (0 if failed else 1))
+                        self.store.update("jobs", job["id"], status="completed", stage="Complete", finished_at=now(), error="")
+                        if failed:
+                            self.store.event("Vercel build failed for " + article["title"], client_id, "error")
+                        return
                 progress("Verifying the live article")
                 verified = verify_live(result["live_url"], article["title"])
                 result = {**result, "status": "published" if verified.get("ok") else "verification_pending", "message": verified.get("message", "")}
@@ -462,6 +567,8 @@ class Engine:
                 from .autopilot import rebuild
                 rebuild(self, client_id)
             self.store.event(job["kind"].capitalize() + " completed", client_id)
+        except cancel.JobCancelled:
+            self.unwind(self.store.get("jobs", job["id"]))
         except Exception as exc:
             message = safe_error(exc)
             self.store.update("jobs", job["id"], status="failed", stage="Needs attention", finished_at=now(), error=message)
@@ -501,6 +608,27 @@ class Engine:
         except (ValueError, KeyError, OSError):
             return False
 
+    def earlier_covers(self, client, article):
+        """Covers of this website's other articles, newest first, for the one-image-per-article guardrail."""
+        from .covers import fingerprint
+        root = (self.data_dir / "covers").resolve()
+        found = []
+        for other in self.articles(client["id"]):
+            cover = other.get("cover") or {}
+            if other["id"] == article["id"] or other.get("status") == "superseded" or not cover.get("path"):
+                continue
+            path = Path(cover["path"]).resolve()
+            if root not in path.parents or path.is_symlink() or not path.is_file():
+                continue
+            value = cover.get("fingerprint")
+            if not value:
+                value = fingerprint(path)
+                if value:
+                    self.store.update("articles", other["id"], cover={**cover, "fingerprint": value})
+            found.append({"title": other.get("title", ""), "alt": cover.get("alt", ""), "fingerprint": value,
+                          "path": str(path), "at": other.get("updated_at", "")})
+        return sorted(found, key=lambda item: item["at"], reverse=True)
+
     def prepare_cover(self, client, article, progress, force=False):
         from .covers import generate_cover
         if not client.get("image_brand", {}).get("colors"):
@@ -515,8 +643,8 @@ class Engine:
         if not force and self.cover_valid(client, article):
             return article
         self.store.update("articles", article["id"], status="generating_cover", error="")
-        progress("Creating a 3D cover matched to the brand and article audience")
-        cover = generate_cover(self.runner(), client, article, self.data_dir, progress=progress)
+        progress("Creating a cover in this website’s house style")
+        cover = generate_cover(self.runner(), client, article, self.data_dir, progress=progress, previous=self.earlier_covers(client, article))
         cover.update(reviewed_article_digest=content_digest(article), reviewed_brand_digest=brand_digest(client))
         article = self.store.update("articles", article["id"], cover=cover, cover_stale=False)
         text_passed = article.get("review", {}).get("passed") and not article.get("review", {}).get("issues") and article.get("reviewed_digest") == content_digest(article) and article.get("reviewed_profile") == profile_digest(client)
@@ -575,8 +703,16 @@ class Engine:
             "content_digest": content_digest(article), "baseline": article.get("change_observation"),
             "note": "Publication started; inspect the later result before assuming the site changed."},
             article["id"] + ":" + article["change_observation"]["started_at"]))
+        if connection.get("provider") == "vercel":
+            from .vercel import sync_site
+            progress("Updating RankMe’s copy of the website from GitHub")
+            link = connection.get("vercel", {})
+            sync_site(self.data_dir, client["id"], link.get("repo", ""), connection.get("branch", ""))
         progress("Publishing and verifying the article")
-        result = publish_article(publish_client, article, progress=progress, data_dir=self.data_dir)
+        from . import cancel
+        with cancel.protected():
+            # A half-finished push or deploy is worse than waiting: publishing cannot be stopped midway.
+            result = publish_article(publish_client, article, progress=progress, data_dir=self.data_dir)
         self.store.update("articles", article["id"], status=result["status"], publish_result=result, error="")
         if result["status"] == "published":
             self.store.update("articles", article["id"], published_at=article.get("published_at") or now())
@@ -597,7 +733,7 @@ class Engine:
         events = sorted(self.store.all("events"), key=lambda j: j["created_at"], reverse=True)[:200]
         return {"clients": clients, "articles": articles, "jobs": jobs, "events": events,
                 "settings": self.store.settings(), "status": self.codex_status,
-                "google": self.google.status(), "seo": seo, "backlinks": self.store.all("backlinks"),
+                "google": self.google.status(), "vercel": self.vercel.status(), "seo": seo, "backlinks": self.store.all("backlinks"),
                 "visibility": visibility, "opportunities": self.store.all("opportunities"),
                 "tasks": self.store.all("tasks"), "research": self.store.all("research"),
                 "measurements": [r for c in clients for r in self.store.history(c["id"], 20)],

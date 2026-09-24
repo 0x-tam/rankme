@@ -72,7 +72,7 @@ assert(vm.runInContext('capturedModal', context).includes('measurement-json'));
 state.clients = [{ id: 'client-a' }]; state.visibility = []; state.measurements = []; state.experiments = [];
 setState(state);
 html = render();
-for (const phrase of ['Define the action that matters', 'No measurements saved yet', 'No experiments tracked yet', 'unconfigured']) assert(html.includes(phrase));
+for (const phrase of ['Define the action that matters', 'No measurements saved yet', 'No experiments tracked yet', 'Unconfigured']) assert(html.includes(phrase));
 vm.runInContext("credentialsLoaded=true;credentialRows=[{id:'id-one',name:'<img src=x onerror=alert(1)>',created_at:1780000000},{id:'id-two',name:'Backup',created_at:1780000000}]",context);
 const passkeys = vm.runInContext('credentialListHTML()',context);
 assert(passkeys.includes('&lt;img'));

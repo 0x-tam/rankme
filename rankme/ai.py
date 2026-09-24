@@ -7,6 +7,8 @@ import shutil
 import subprocess
 import tempfile
 
+from . import cancel
+
 
 class AIError(RuntimeError):
     def __init__(self, message, retryable=False):
@@ -118,8 +120,8 @@ class CodexRunner:
             # Redirect events into an ephemeral file to avoid unbounded memory or leaking account data into logs.
             with open(Path(temp) / 'events.log', 'w+', encoding='utf-8') as log:
                 try:
-                    result = subprocess.run(command, input=preamble + prompt, stdout=log, stderr=log,
-                                            text=True, timeout=self.timeout, env=self._env())
+                    result = cancel.run(command, input=preamble + prompt, stdout=log, stderr=log,
+                                        text=True, timeout=self.timeout, env=self._env())
                 except subprocess.TimeoutExpired:
                     raise AIError('Codex job timed out. Retry this job.', retryable=True)
                 except OSError:

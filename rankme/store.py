@@ -99,6 +99,25 @@ class Store:
                                 (record["id"], json.dumps(record, ensure_ascii=False)))
             return [self.get(table, record["id"]) if table == "measurements" else record for table, record in prepared]
 
+    def delete(self, table, ident):
+        if table == "measurements":
+            raise ValueError("Measurement history is append-only")
+        with self.lock, self.db:
+            if not self.db.execute("DELETE FROM " + self._table(table) + " WHERE id=?", (ident,)).rowcount:
+                raise KeyError("Record not found")
+
+    def delete_client(self, client_id):
+        """Remove one client and every record that belongs to it, in a single transaction."""
+        with self.lock, self.db:
+            for table in sorted(self.TABLES - {"clients"}):
+                self.db.execute("DELETE FROM " + table + " WHERE json_extract(data, '$.client_id')=?", (client_id,))
+            # Per-client singleton reports are keyed by the client id itself.
+            for table in ("seo", "visibility"):
+                self.db.execute("DELETE FROM " + table + " WHERE id=?", (client_id,))
+            removed = self.db.execute("DELETE FROM clients WHERE id=?", (client_id,)).rowcount
+        if not removed:
+            raise KeyError("Record not found")
+
     def settings(self, fields=None):
         defaults = {"codex_path": "codex", "model": "", "paused": False,
                     "weekly_day": 1, "weekly_hour": 9, "max_pages": 24}
