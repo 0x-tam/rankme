@@ -181,7 +181,7 @@ Common problems:
 
 This release provides public-site inspection, approved business profiles, subject planning, weekly article production, review gates, local export, configurable Git/command deployment, live-page verification, activity history, and local backup export.
 
-It does not include a backlink exchange, paid keyword-volume data, automatic Search Console analytics, traffic or lead attribution, automatic article-performance refreshes, or automatic performance-based revisions. Those require additional integrations or dedicated workflows. The first release measures execution and publication status, not SEO outcomes.
+Connected Google properties now refresh automatically, and the visibility workflow can prepare protected refresh drafts from observed performance declines. Paid keyword-volume data, complete backlink coverage, arbitrary site fixes, and broader AI-platform measurements still require integrations. Link exchange and outreach are excluded. See VISIBILITY.md for precise current capabilities and limitations.
 
 ## Project evidence
 
