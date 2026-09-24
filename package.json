@@ -1,0 +1,21 @@
+{
+  "scripts": {
+    "build:web": "node scripts/build-web.mjs",
+    "typecheck": "tsc --noEmit --target ES2022 --module esnext --moduleResolution bundler cloud/index.ts neon.ts",
+    "cloud:migrate": "node --import tsx scripts/cloud-admin.ts migrate",
+    "cloud:bootstrap": "node --import tsx scripts/cloud-admin.ts bootstrap"
+  },
+  "dependencies": {
+    "@neon/config": "^1.7.3",
+    "@neon/env": "^1.4.4",
+    "@neon/functions": "^0.11.0",
+    "@simplewebauthn/server": "^14.0.2",
+    "pg": "^8.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "@types/pg": "^8.23.1",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}

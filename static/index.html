@@ -1,1 +1,37 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RankMe — Content operations</title><link rel="icon" href="/static/favicon.svg"><link rel="stylesheet" href="/static/styles.css"></head><body><noscript><p style="padding:24px">Enable JavaScript to use this local RankMe workspace.</p></noscript><div class="app"><aside class="sidebar"><a class="brand" href="#overview"><span class="brandmark">r<span>↗</span></span>RankMe<span class="local">LOCAL</span></a><div class="workspace-label">YOUR WORKSPACE</div><nav aria-label="Main navigation"><button data-nav="overview" class="active">◫ <span>Overview</span></button><button data-nav="clients">▦ <span>Clients</span></button><button data-nav="content">▤ <span>Content library</span></button><button data-nav="activity">◷ <span>Activity</span></button></nav><div class="sidebar-bottom"><button data-nav="settings">⚙ <span>Settings</span></button><div class="privacy"><span class="online-dot"></span>Private workspace<small>Stored on this computer</small></div></div></aside><div class="main"><header class="topbar"><span id="breadcrumb">Workspace <b>/</b> Overview</span><div><span class="desktop-label">One article. Every week.</span><button class="button primary small" id="add-client">＋ Add website</button></div></header><main id="page" tabindex="-1"></main><footer>RankMe <span>Local-first content operations</span><span id="last-sync"></span></footer></div></div><div id="toast" role="status" aria-live="polite"></div><dialog id="modal"><div class="dialog-head"><div><span class="eyebrow" id="modal-eyebrow">RANKME</span><h2 id="modal-title"></h2></div><button class="icon-button" id="modal-close" aria-label="Close dialog">✕</button></div><div id="modal-body"></div></dialog><script src="/static/app.js" defer></script></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RankMe — Content operations</title>
+  <link rel="icon" href="/static/favicon.svg">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <noscript><p style="padding:24px">Enable JavaScript to unlock RankMe.</p></noscript>
+  <div id="auth-screen" class="auth-screen">
+    <div class="auth-card">
+      <div class="auth-brand"><span class="brandmark">r<span>↗</span></span><strong>RankMe</strong><span class="auth-local" id="auth-workspace-label">PRIVATE WORKSPACE</span></div>
+      <div class="auth-icon" aria-hidden="true">✦</div>
+      <span class="eyebrow">YOUR PRIVATE WORKSPACE</span>
+      <h1 id="auth-title">Welcome back.</h1>
+      <p id="auth-description">Unlock your content workspace with your passkey.</p>
+      <p id="auth-error" class="auth-error" role="alert" hidden></p>
+      <div id="auth-login" hidden><button id="auth-sign-in" class="button primary auth-button" type="button">Continue with passkey</button></div>
+      <form id="auth-enroll" hidden>
+        <div id="auth-bootstrap-field"><label for="auth-bootstrap">One-time setup code</label>
+        <input id="auth-bootstrap" name="bootstrap" type="text" autocomplete="off" spellcheck="false" placeholder="Paste the code from your setup link">
+        <p class="hint">Open the one-time setup link provided by the workspace owner. If you followed that link, the code is already ready.</p></div>
+        <button class="button primary auth-button" type="submit">Create my passkey</button>
+      </form>
+      <p id="auth-guidance" class="auth-guidance">Passkeys use your device’s screen lock, Touch ID, or security key. Open RankMe in a current browser at <strong id="auth-address"></strong>.</p>
+    </div>
+    <p class="auth-footer">Private content operations.</p>
+  </div>
+  <div class="app" hidden><aside class="sidebar"><a class="brand" href="#overview"><span class="brandmark">r<span>↗</span></span>RankMe<span class="local" id="workspace-mode-label">LOCAL</span></a><div class="workspace-label">YOUR WORKSPACE</div><nav aria-label="Main navigation"><button data-nav="overview" class="active">◫ <span>Overview</span></button><button data-nav="clients">▦ <span>Clients</span></button><button data-nav="content">▤ <span>Content library</span></button><button data-nav="activity">◷ <span>Activity</span></button></nav><div class="sidebar-bottom"><button data-nav="settings">⚙ <span>Settings</span></button><div class="privacy"><span class="online-dot"></span>Private workspace<small id="workspace-storage-label">Stored on this computer</small></div></div></aside><div class="main"><header class="topbar"><span id="breadcrumb">Workspace <b>/</b> Overview</span><div><span class="desktop-label">One article. Every week.</span><button class="button primary small" id="add-client">＋ Add website</button><button class="button small" id="sign-out" type="button">Lock workspace</button></div></header><main id="page" tabindex="-1"></main><footer>RankMe <span id="workspace-footer-label">Local-first content operations</span><span id="last-sync"></span></footer></div></div>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <dialog id="modal"><div class="dialog-head"><div><span class="eyebrow" id="modal-eyebrow">RANKME</span><h2 id="modal-title"></h2></div><button class="icon-button" id="modal-close" aria-label="Close dialog">✕</button></div><div id="modal-body"></div></dialog>
+  <script src="/static/auth.js" defer></script>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

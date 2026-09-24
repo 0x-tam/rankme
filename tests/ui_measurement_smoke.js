@@ -6,8 +6,9 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '../static/app.js'), 'utf8');
-const context = vm.createContext({ URL, console, setTimeout, clearTimeout });
-vm.runInContext(source.slice(0, source.indexOf("document.addEventListener('click'")), context);
+const context = vm.createContext({ URL, console, setTimeout, clearTimeout,
+  document: { documentElement: { dataset: {} } } });
+vm.runInContext(source.slice(0, source.indexOf("document.addEventListener('pointerdown'")), context);
 const goal = { goal_type: 'lead', event_name: 'generate_lead', landing_page: 'https://example.com/contact' };
 const current = { start: '2026-08-01', end: '2026-08-28', organic_sessions: 120, conversions: 8, event_name: goal.event_name };
 const client = { id: 'client-a', conversion_goal: goal };
@@ -72,4 +73,27 @@ state.clients = [{ id: 'client-a' }]; state.visibility = []; state.measurements 
 setState(state);
 html = render();
 for (const phrase of ['Define the action that matters', 'No measurements saved yet', 'No experiments tracked yet', 'unconfigured']) assert(html.includes(phrase));
-console.log('Measurement UI smoke checks passed: goals, stale data, history, experiments, evidence, and escaping.');
+vm.runInContext("credentialsLoaded=true;credentialRows=[{id:'id-one',name:'<img src=x onerror=alert(1)>',created_at:1780000000},{id:'id-two',name:'Backup',created_at:1780000000}]",context);
+const passkeys = vm.runInContext('credentialListHTML()',context);
+assert(passkeys.includes('&lt;img'));
+assert(!passkeys.includes('<img'));
+assert.equal((passkeys.match(/data-action="passkey-remove"/g)||[]).length,2);
+vm.runInContext('credentialRows=credentialRows.slice(0,1)',context);
+assert(vm.runInContext('credentialListHTML()',context).includes('disabled title="Keep at least one passkey"'));
+// Passive polling must not count as owner activity; only a trusted gesture does.
+const routes = [];
+const snapshot = vm.runInContext('state', context);
+context.document = { querySelector: () => ({textContent:''}) };
+context.RankMeAuth = {csrf:'csrf-value'};
+context.fetch = async route => { routes.push(route); return {ok:true,status:200,json:async()=>snapshot}; };
+vm.runInContext('authenticated=true;lastState=JSON.stringify(state)',context);
+(async()=>{
+  await vm.runInContext('refresh()',context);
+  assert.deepEqual(routes,['/api/state']);
+  vm.runInContext("userTouch({isTrusted:false,target:{closest:()=>true}})",context);
+  assert.deepEqual(routes,['/api/state']);
+  vm.runInContext("userTouch({isTrusted:true,target:{closest:()=>true}})",context);
+  vm.runInContext("userTouch({isTrusted:true,target:{closest:()=>true}})",context);
+  assert.deepEqual(routes,['/api/state','/api/auth/touch']);
+  console.log('Measurement UI smoke checks passed: goals, stale data, history, experiments, escaping, and passive polling.');
+})().catch(error=>{console.error(error);process.exitCode=1;});

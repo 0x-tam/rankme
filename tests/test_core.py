@@ -20,6 +20,8 @@ class CoreTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.app = Application(self.root)
+        self.http_session = self.app.auth.new_session('test-credential')
+        self.http_csrf = self.app.auth.session(self.http_session)[1]['csrf']
         self.store = self.app.store
         self.engine = self.app.engine
         self.engine.runner_factory = lambda: Mock()
@@ -471,7 +473,8 @@ class CoreTests(unittest.TestCase):
         handler = object.__new__(cls)
         handler.server = SimpleNamespace(server_port=8787)
         handler.path = path
-        handler.headers = {'Host': '127.0.0.1:8787', **(headers or {})}
+        handler.headers = {'Host': 'localhost:8787', 'Cookie': '__Host-rankme-session=' + self.http_session,
+                           **(headers or {})}
         handler.rfile = io.BytesIO(body)
         handler.send = Mock()
         handler.handle_request(method)
@@ -485,7 +488,7 @@ class CoreTests(unittest.TestCase):
 
     def test_http_requires_token_json_and_bounded_body(self):
         self.assertEqual(self.request('PATCH', '/api/settings').args[0], 403)
-        auth = {'X-RankMe-Token': self.app.token}
+        auth = {'X-RankMe-Token': self.http_csrf, 'Origin': 'http://localhost:8787'}
         self.assertEqual(self.request('PATCH', '/api/settings', auth).args[0], 415)
         auth['Content-Type'] = 'application/json'
         self.assertEqual(self.request('PATCH', '/api/settings', {**auth, 'Content-Length': '2000001'}).args[0], 413)

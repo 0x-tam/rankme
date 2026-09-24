@@ -1,5 +1,6 @@
-"""Loopback-only web application. No account, API key, or cloud database required."""
+"""Loopback-only web application with a local passkey owner."""
 import argparse
+from http import cookies
 import fcntl
 import json
 import mimetypes
@@ -12,26 +13,39 @@ import threading
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse, unquote, parse_qs
+from urllib.parse import urlparse, parse_qs
 
-from .store import Store, now, uid
+from .auth import AuthError, AuthService, issue_bootstrap, reset_for_recovery
+from .store import Store, uid
 from .engine import Engine, first_run, parse_date, safe_error, brand_digest
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
 class Application:
-    def __init__(self, data_dir, engine_factory=Engine):
+    def __init__(self, data_dir, engine_factory=Engine, port=8787):
         self.data_dir = Path(data_dir).resolve()
         self.data_dir.mkdir(parents=True, exist_ok=True)
         try:
             self.data_dir.chmod(0o700)
         except OSError:
             pass
+        self.auth = AuthService(self.data_dir, port)
         self.store = Store(self.data_dir / "rankme.sqlite3")
         self.engine = engine_factory(self.store, self.data_dir)
-        self.token = secrets.token_urlsafe(32)
-        self.oauth_redirect = "http://127.0.0.1:8787/api/google/callback"
+        self.instance = secrets.token_urlsafe(24)
+        self.oauth_redirect = f"http://localhost:{port}/api/google/callback"
+        self.start_worker_on_enroll = False
+        self._engine_start_lock = threading.Lock()
+        self._engine_started = False
+
+    def start_engine(self):
+        """Start the local engine once, after local or cloud owner enrollment."""
+        with self._engine_start_lock:
+            if not self._engine_started:
+                self.engine.start()
+                self._engine_started = True
+            self.start_worker_on_enroll = False
 
     def busy(self, client_id):
         return any(j["client_id"] == client_id and j["status"] in ("queued", "running") for j in self.store.all("jobs"))
@@ -155,8 +169,6 @@ class Application:
 
     def dispatch(self, method, path, data):
         parts = path.strip("/").split("/")
-        if method == "GET" and path == "/api/session":
-            return {"token": self.token}
         if method == "GET" and path == "/api/state":
             return self.engine.state()
         if method == "POST" and len(parts) == 4 and parts[:2] == ["api", "experiments"] and parts[3] == "cancel":
@@ -317,19 +329,35 @@ def handler_for(app):
             # Do not log URL query strings or request bodies.
             pass
 
-        def trusted(self):
-            host = self.headers.get("Host", "")
-            allowed = {"127.0.0.1:" + str(self.server.server_port), "localhost:" + str(self.server.server_port)}
-            if host not in allowed:
+        def cookie(self, name):
+            try:
+                jar = cookies.SimpleCookie()
+                jar.load(self.headers.get("Cookie", "")[:4096])
+                return jar[name].value if name in jar else ""
+            except cookies.CookieError:
+                return ""
+
+        def session(self, touch=False):
+            return app.auth.session(self.cookie("__Host-rankme-session"), touch=touch)
+
+        def csrf(self, expected):
+            supplied = self.headers.get("X-RankMe-CSRF", "") or self.headers.get("X-RankMe-Token", "")
+            return bool(supplied) and len(supplied) <= 256 and secrets.compare_digest(supplied, expected)
+
+        def trusted(self, method):
+            canonical = "localhost:" + str(self.server.server_port)
+            if self.headers.get("Host") != canonical:
                 return False
             origin = self.headers.get("Origin")
-            if origin and origin not in {"http://" + h for h in allowed}:
+            if method != "GET" and origin != "http://" + canonical:
+                return False
+            if origin and origin != "http://" + canonical:
                 return False
             if self.headers.get("Sec-Fetch-Site") == "cross-site":
                 return False
             return True
 
-        def send(self, status, body, content_type="application/json; charset=utf-8", attachment=None):
+        def send(self, status, body, content_type="application/json; charset=utf-8", attachment=None, set_cookies=()):
             if isinstance(body, (dict, list)):
                 body = json.dumps(body, ensure_ascii=False).encode()
             elif isinstance(body, str):
@@ -340,7 +368,13 @@ def handler_for(app):
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+            self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+            self.send_header("Permissions-Policy", 'camera=(), microphone=(), geolocation=(), payment=(), publickey-credentials-get=(self)')
             self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+            for cookie in set_cookies:
+                self.send_header("Set-Cookie", cookie)
             if attachment:
                 self.send_header("Content-Disposition", 'attachment; filename="' + attachment + '"')
             self.end_headers()
@@ -358,35 +392,123 @@ def handler_for(app):
         def do_PATCH(self):
             self.handle_request("PATCH")
 
+        def do_DELETE(self):
+            self.handle_request("DELETE")
+
         def handle_request(self, method):
-            # OAuth returns from Google as a cross-site top-level navigation. Only
-            # this read-only callback bypasses the same-origin check; one-use state
-            # and PKCE bind it to an authorization started in this local app.
-            if method == "GET" and urlparse(self.path).path == "/api/google/callback":
-                if self.headers.get("Host") != "127.0.0.1:" + str(self.server.server_port):
-                    return self.send(403, {"error": "Invalid callback host"})
+            path = urlparse(self.path).path
+            port = self.server.server_port
+            host = self.headers.get("Host", "")
+            if method == "GET" and path == "/api/health" and host in (f"localhost:{port}", f"127.0.0.1:{port}"):
+                busy = any(j["status"] == "running" for j in app.store.all("jobs")) if app.auth.enrolled() else False
+                return self.send(200, {"service": "rankme", "version": "1", "instance": app.instance, "busy": busy})
+            if method == "GET" and host == f"127.0.0.1:{port}" and path in ("/", "/index.html", "/app.js", "/styles.css", "/favicon.svg"):
+                self.send_response(302)
+                self.send_header("Location", f"http://localhost:{port}{self.path}")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            # Google returns by top-level cross-site navigation. SameSite=Lax
+            # supplies the initiating session; state and PKCE remain one-use.
+            if method == "GET" and path == "/api/google/callback":
+                if host != f"localhost:{port}":
+                    return self.send(403, {"error": "Connection failed"})
                 query = parse_qs(urlparse(self.path).query)
+                session = self.session()
                 try:
+                    app.auth.consume_oauth(session[0] if session else "", query.get("state", [""])[0])
                     app.engine.google.callback(query.get("code", [""])[0], query.get("state", [""])[0], app.oauth_redirect)
                     return self.send(200, '<!doctype html><title>Google connected</title><h1>Google connected</h1><p>Return to RankMe and choose your website property.</p><a href="/">Open RankMe</a>', "text/html; charset=utf-8")
                 except Exception:
-                    return self.send(400, '<!doctype html><title>Connection incomplete</title><h1>Google connection incomplete</h1><p>Return to RankMe and try connecting again. No metrics have been imported.</p><a href="/">Open RankMe</a>', "text/html; charset=utf-8")
-            if not self.trusted():
-                return self.send(403, {"error": "RankMe accepts same-origin localhost requests only"})
-            path = urlparse(self.path).path
+                    return self.send(400, '<!doctype html><title>Connection incomplete</title><h1>Google connection incomplete</h1><p>Return to RankMe and try connecting again.</p><a href="/">Open RankMe</a>', "text/html; charset=utf-8")
+            if not self.trusted(method):
+                return self.send(403, {"error": "Request denied"})
             try:
+                session = self.session()
+                if method == "GET" and path == "/api/auth/status":
+                    if session:
+                        return self.send(200, {"enrolled": app.auth.enrolled(), "authenticated": True,
+                                               "csrf": session[1]["csrf"]})
+                    raw, csrf = app.auth.preauth_status(self.cookie("__Host-rankme-preauth"))
+                    return self.send(200, {"enrolled": app.auth.enrolled(), "authenticated": False, "csrf": csrf},
+                                     set_cookies=(f"__Host-rankme-preauth={raw}; Max-Age=600; Path=/; HttpOnly; Secure; SameSite=Lax",))
+                if method == "GET" and path == "/api/session":
+                    if not session:
+                        return self.send(401, {"error": "Authentication required"})
+                    csrf = session[1]["csrf"]
+                    return self.send(200, {"csrf": csrf, "token": csrf})
                 data = {}
                 if method != "GET":
-                    if not secrets.compare_digest(self.headers.get("X-RankMe-Token", ""), app.token):
-                        return self.send(403, {"error": "Session expired. Reload RankMe."})
+                    if path.startswith("/api/auth/") and path in (
+                            "/api/auth/enroll/options", "/api/auth/enroll/verify",
+                            "/api/auth/login/options", "/api/auth/login/verify"):
+                        binding = app.auth.preauth_check(self.cookie("__Host-rankme-preauth"),
+                            self.headers.get("X-RankMe-CSRF", ""))
+                    else:
+                        if not session:
+                            return self.send(401, {"error": "Authentication required"})
+                        if not self.csrf(session[1]["csrf"]):
+                            return self.send(403, {"error": "Request denied"})
+                        session = self.session(touch=True)
                     if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
                         return self.send(415, {"error": "Send application/json"})
                     length = int(self.headers.get("Content-Length", "0"))
-                    if not 0 <= length <= 2_000_000:
+                    limit = 64_000 if path.startswith("/api/auth/") else 2_000_000
+                    if not 0 <= length <= limit:
                         return self.send(413, {"error": "Request is too large"})
                     data = json.loads(self.rfile.read(length) or b"{}")
                     if not isinstance(data, dict):
                         raise ValueError("Request must be a JSON object")
+                if path.startswith("/api/auth/"):
+                    if method == "POST" and path == "/api/auth/enroll/options":
+                        return self.send(200, app.auth.enroll_options(binding, data.get("bootstrap_secret"), data.get("name", "")))
+                    if method == "POST" and path == "/api/auth/enroll/verify":
+                        raw = app.auth.enroll_verify(binding, data.get("credential"))
+                        if app.start_worker_on_enroll:
+                            app.start_engine()
+                        return self.send(200, {"ok": True}, set_cookies=(
+                            f"__Host-rankme-session={raw}; Max-Age=28800; Path=/; HttpOnly; Secure; SameSite=Lax",
+                            "__Host-rankme-preauth=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax"))
+                    if method == "POST" and path == "/api/auth/login/options":
+                        return self.send(200, app.auth.login_options(binding))
+                    if method == "POST" and path == "/api/auth/login/verify":
+                        raw = app.auth.login_verify(binding, data.get("credential"))
+                        return self.send(200, {"ok": True}, set_cookies=(
+                            f"__Host-rankme-session={raw}; Max-Age=28800; Path=/; HttpOnly; Secure; SameSite=Lax",
+                            "__Host-rankme-preauth=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax"))
+                    if not session:
+                        return self.send(401, {"error": "Authentication required"})
+                    if method == "POST" and path == "/api/auth/logout":
+                        app.auth.logout(self.cookie("__Host-rankme-session"))
+                        return self.send(200, {"ok": True}, set_cookies=(
+                            "__Host-rankme-session=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax",))
+                    if method == "POST" and path == "/api/auth/touch":
+                        return self.send(200, {"ok": True})
+                    if method == "GET" and path == "/api/auth/credentials":
+                        return self.send(200, {"credentials": app.auth.list_credentials()})
+                    if method == "POST" and path == "/api/auth/step-up/options":
+                        return self.send(200, app.auth.step_up_options(session[0]))
+                    if method == "POST" and path == "/api/auth/step-up/verify":
+                        app.auth.step_up_verify(session[0], data.get("credential"))
+                        return self.send(200, {"ok": True})
+                    if method == "POST" and path == "/api/auth/credentials/options":
+                        return self.send(200, app.auth.add_options(session[0], data.get("name", "")))
+                    if method == "POST" and path == "/api/auth/credentials/verify":
+                        app.auth.add_verify(session[0], data.get("credential"))
+                        return self.send(200, {"ok": True})
+                    match = re.fullmatch(r"/api/auth/credentials/([A-Za-z0-9_-]{1,8192})", path)
+                    if method == "DELETE" and match:
+                        app.auth.remove(session[0], match.group(1))
+                        return self.send(200, {"ok": True})
+                    raise KeyError("Endpoint not found")
+                if path.startswith("/api/") and not session:
+                    return self.send(401, {"error": "Authentication required"})
+                if method == "POST" and path == "/api/google/connect":
+                    result = app.dispatch(method, path, data)
+                    state = parse_qs(urlparse(result["url"]).query).get("state", [""])[0]
+                    app.auth.begin_oauth(session[0], state)
+                    return self.send(200, result)
                 if method == "GET" and path == "/api/backup":
                     return self.send(200, app.store.backup(), attachment="rankme-backup.json")
                 cover_route = re.fullmatch(r"/api/articles/([a-f0-9]+)/cover", path)
@@ -426,18 +548,20 @@ def handler_for(app):
                     return self.send(200, app.dispatch(method, path, data))
                 if method != "GET":
                     raise KeyError("Endpoint not found")
-                names = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/styles.css": "styles.css", "/favicon.svg": "favicon.svg"}
-                names.update({"/static/" + name: name for name in ("app.js", "styles.css", "favicon.svg")})
+                names = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/auth.js": "auth.js", "/styles.css": "styles.css", "/favicon.svg": "favicon.svg"}
+                names.update({"/static/" + name: name for name in ("app.js", "auth.js", "styles.css", "favicon.svg")})
                 if path not in names:
                     raise KeyError("Page not found")
                 file = ROOT / "static" / names[path]
                 return self.send(200, file.read_bytes(), (mimetypes.guess_type(str(file))[0] or "application/octet-stream") + "; charset=utf-8")
+            except AuthError as exc:
+                self.send(exc.status, {"error": str(exc)})
             except KeyError as exc:
                 self.send(404, {"error": str(exc).strip("'")})
             except (ValueError, TypeError, json.JSONDecodeError) as exc:
                 self.send(400, {"error": safe_error(exc)[:1000]})
-            except Exception as exc:
-                self.send(400, {"error": safe_error(exc)[:1000]})
+            except Exception:
+                self.send(500, {"error": "Request failed"})
     return Handler
 
 
@@ -446,11 +570,39 @@ def main(argv=None):
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument("--data-dir", default=str(ROOT / "data"))
     parser.add_argument("--no-worker", action="store_true", help=argparse.SUPPRESS)
+    command = parser.add_mutually_exclusive_group()
+    command.add_argument("--bootstrap-secret", action="store_true", help="Issue a short-lived first-owner enrollment secret in this terminal")
+    command.add_argument("--recover-passkeys", action="store_true", help="Reset lost passkeys with local OS access and a stopped server")
     args = parser.parse_args(argv)
     if not 1024 <= args.port <= 65535:
         parser.error("Port must be between 1024 and 65535")
-    app = Application(args.data_dir)
-    app.oauth_redirect = "http://127.0.0.1:" + str(args.port) + "/api/google/callback"
+    if args.bootstrap_secret:
+        if not sys.stdout.isatty():
+            parser.error("Enrollment secret requires an interactive local terminal")
+        print(issue_bootstrap(args.data_dir))
+        return 0
+    if args.recover_passkeys:
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            parser.error("Passkey recovery requires an interactive local terminal")
+        data_dir = Path(args.data_dir).expanduser().resolve()
+        data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        descriptor = os.open(data_dir / "server.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(descriptor)
+            parser.error("Stop RankMe before passkey recovery")
+        try:
+            print("This removes every RankMe passkey. Existing sessions end when the server restarts.")
+            if input("Type RESET RANKME PASSKEYS to continue: ") != "RESET RANKME PASSKEYS":
+                print("Recovery canceled")
+                return 1
+            reset_for_recovery(data_dir)
+            print("Passkeys reset. Start RankMe, then run the launcher's explicit --enroll command.")
+            return 0
+        finally:
+            os.close(descriptor)
+    app = Application(args.data_dir, port=args.port)
     data_lock = (app.data_dir / "server.lock").open("a")
     try:
         fcntl.flock(data_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -466,11 +618,30 @@ def main(argv=None):
         data_lock.close()
         app.store.close()
         return 1
+    cloud_worker = None
     if not args.no_worker:
-        app.engine.start()
-    print("RankMe is running at http://127.0.0.1:" + str(args.port), flush=True)
+        cloud_config = app.data_dir / "cloud-bridge.json"
+        try:
+            if cloud_config.exists() or cloud_config.is_symlink():
+                from .cloud_bridge import CloudWorker
+                cloud_worker = CloudWorker(app, cloud_config, on_owner_enrolled=app.start_engine)
+        except Exception:
+            server.server_close()
+            data_lock.close()
+            app.store.close()
+            print("Cloud worker configuration is invalid; check the private cloud-bridge.json file.", file=sys.stderr)
+            return 1
+        if app.auth.enrolled():
+            app.start_engine()
+        else:
+            app.start_worker_on_enroll = True
+        if cloud_worker:
+            cloud_worker.start()
+    print("RankMe is running at http://localhost:" + str(args.port), flush=True)
     print("Local data: " + str(app.data_dir), flush=True)
     def stop(*unused):
+        if cloud_worker:
+            cloud_worker.stop_event.set()
         app.engine.stop_event.set()
         app.engine.wake.set()
         threading.Thread(target=server.shutdown, daemon=True).start()
@@ -479,6 +650,8 @@ def main(argv=None):
     try:
         server.serve_forever(poll_interval=0.5)
     finally:
+        if cloud_worker:
+            cloud_worker.stop()
         server.server_close()
         app.engine.stop_event.set()
         app.engine.wake.set()

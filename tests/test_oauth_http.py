@@ -18,7 +18,11 @@ class OAuthHTTPTests(unittest.TestCase):
         self.google.status.return_value = {'configured': True, 'connected': False}
         self.google.configure.return_value = {'configured': True, 'connected': False}
         self.app.engine.google = self.google
-        self.app.oauth_redirect = 'http://127.0.0.1:8787/api/google/callback'
+        self.app.oauth_redirect = 'http://localhost:8787/api/google/callback'
+        self.raw_session = self.app.auth.new_session('test-credential')
+        self.session_key, entry = self.app.auth.session(self.raw_session)
+        self.csrf = entry['csrf']
+        self.app.auth.begin_oauth(self.session_key, 'one-use-state')
 
     def tearDown(self):
         self.app.store.close()
@@ -29,7 +33,8 @@ class OAuthHTTPTests(unittest.TestCase):
         handler.server = SimpleNamespace(server_port=8787)
         handler.path = path
         body = json.dumps(payload or {}).encode()
-        handler.headers = {'Host': '127.0.0.1:8787', 'Content-Length': str(len(body)), **(headers or {})}
+        handler.headers = {'Host': 'localhost:8787', 'Cookie': '__Host-rankme-session=' + self.raw_session,
+                           'Content-Length': str(len(body)), **(headers or {})}
         handler.rfile = io.BytesIO(body)
         handler.send = Mock()
         handler.handle_request(method)
@@ -46,7 +51,7 @@ class OAuthHTTPTests(unittest.TestCase):
         self.assertNotIn('one-use-state', response[1])
 
     def test_callback_requires_exact_loopback_host_and_port(self):
-        for host in ('evil.test:8787', 'localhost:8787', '127.0.0.1:8788', '127.0.0.1:8787.evil.test'):
+        for host in ('evil.test:8787', '127.0.0.1:8787', '127.0.0.1:8788', 'localhost:8787.evil.test'):
             with self.subTest(host=host):
                 self.assertEqual(self.request('GET', self.callback_path(), {'Host': host, 'Sec-Fetch-Site': 'cross-site'})[0], 403)
         self.google.callback.assert_not_called()
@@ -57,11 +62,24 @@ class OAuthHTTPTests(unittest.TestCase):
                 raise ValueError('Sensitive failure: code=' + code + ' state=' + state)
             return {'connected': True}
         self.google.callback.side_effect = validate
+        self.app.auth.begin_oauth(self.session_key, 'wrong-secret-state')
         result = self.request('GET', self.callback_path(state='wrong-secret-state'), {'Sec-Fetch-Site': 'cross-site'})
         self.assertEqual(result[0], 400)
         self.assertNotIn('wrong-secret-state', result[1])
         self.assertNotIn('secret-code', result[1])
         self.assertNotIn('Sensitive failure', result[1])
+
+    def test_callback_requires_initiating_authenticated_session(self):
+        other = self.app.auth.new_session('other-credential')
+        result = self.request('GET', self.callback_path(), {'Cookie': '__Host-rankme-session=' + other,
+            'Sec-Fetch-Site': 'cross-site'})
+        self.assertEqual(result[0], 400)
+        self.google.callback.assert_not_called()
+        result = self.request('GET', self.callback_path(), {'Cookie': '', 'Sec-Fetch-Site': 'cross-site'})
+        self.assertEqual(result[0], 400)
+        self.google.callback.assert_not_called()
+        self.assertEqual(self.request('GET', self.callback_path(), {'Sec-Fetch-Site': 'cross-site'})[0], 200)
+        self.google.callback.assert_called_once()
 
     def test_regular_crosssite_apis_remain_blocked(self):
         for path in ('/api/session', '/api/state', '/api/google/properties', '/api/backup'):
@@ -72,7 +90,7 @@ class OAuthHTTPTests(unittest.TestCase):
 
     def test_callback_crosssite_exception_is_get_only(self):
         result = self.request('POST', self.callback_path(), {'Sec-Fetch-Site': 'cross-site',
-            'X-RankMe-Token': self.app.token, 'Content-Type': 'application/json'})
+            'X-RankMe-Token': self.csrf, 'Content-Type': 'application/json'})
         self.assertEqual(result[0], 403)
         self.google.callback.assert_not_called()
 
@@ -80,7 +98,8 @@ class OAuthHTTPTests(unittest.TestCase):
         payload = {'client_id': 'desktop.apps.googleusercontent.com', 'client_secret': 'PRIVATE_CLIENT_SECRET'}
         self.assertEqual(self.request('POST', '/api/google/configure', {'Content-Type': 'application/json'}, payload)[0], 403)
         self.assertEqual(self.request('POST', '/api/google/configure', {'Content-Type': 'application/json', 'X-RankMe-Token': 'wrong'}, payload)[0], 403)
-        auth = {'Content-Type': 'application/json', 'X-RankMe-Token': self.app.token}
+        auth = {'Content-Type': 'application/json', 'X-RankMe-Token': self.csrf,
+                'Origin': 'http://localhost:8787'}
         self.assertEqual(self.request('POST', '/api/google/configure', {**auth, 'Origin': 'https://evil.test'}, payload)[0], 403)
         self.google.configure.assert_not_called()
         result = self.request('POST', '/api/google/configure', auth, payload)

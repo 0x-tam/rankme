@@ -1,12 +1,16 @@
 #!/bin/bash
 set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "Python 3.9 or later is required. Install Python, then open RankMe again."
+PYTHON="$SCRIPT_DIR/.venv/bin/python"
+if [ ! -x "$PYTHON" ]; then
+  echo "RankMe needs a local Python environment. In Terminal, run:"
+  echo "  cd \"$SCRIPT_DIR\""
+  echo "  python3.12 -m venv .venv"
+  echo "  .venv/bin/python -m pip install -r requirements.txt"
   read -r -p "Press Return to close. "
   exit 1
 fi
-python3 "$SCRIPT_DIR/scripts/launch.py"
+"$PYTHON" "$SCRIPT_DIR/scripts/launch.py"
 RESULT=$?
 if [ "$RESULT" -ne 0 ]; then
   read -r -p "Press Return to close. "

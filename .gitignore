@@ -18,3 +18,8 @@ token.json
 *.sqlite3-*
 *.log
 .codex/
+.vercel
+.neon
+node_modules/
+dist/
+.vercel-stage/
