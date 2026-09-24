@@ -16,7 +16,7 @@ def uid():
 
 
 class Store:
-    TABLES = {"clients", "articles", "jobs", "events", "seo", "backlinks"}
+    TABLES = {"clients", "articles", "jobs", "events", "seo", "backlinks", "visibility", "opportunities", "research", "tasks", "answer_probes"}
 
     def __init__(self, path):
         self.path = Path(path)
@@ -61,6 +61,22 @@ class Store:
             record = self.get(table, ident)
             record.update(fields)
             return self.put(table, record)
+
+    def put_many(self, records):
+        """Commit dependent records together, without nested per-record commits."""
+        prepared = []
+        for table, value in records:
+            self._table(table)
+            record = dict(value)
+            record.setdefault("id", uid())
+            record.setdefault("created_at", now())
+            record["updated_at"] = now()
+            prepared.append((table, record))
+        with self.lock, self.db:
+            for table, record in prepared:
+                self.db.execute("INSERT OR REPLACE INTO " + table + " (id,data) VALUES (?,?)",
+                                (record["id"], json.dumps(record, ensure_ascii=False)))
+        return [record for _, record in prepared]
 
     def settings(self, fields=None):
         defaults = {"codex_path": "codex", "model": "", "paused": False,

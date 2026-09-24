@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import stat
 import tempfile
 import threading
 import time
@@ -42,9 +43,16 @@ class _NoRedirect(HTTPRedirectHandler):
 
 
 def _http(url, method='GET', payload=None, token='', form=False):
-    parsed = urlsplit(url)
-    if parsed.scheme != 'https' or parsed.hostname not in GOOGLE_HOSTS or parsed.username or parsed.password:
+    try:
+        parsed = urlsplit(url)
+        valid_port = parsed.port in (None, 443)
+    except ValueError:
+        raise GoogleDataError('Invalid Google service endpoint.') from None
+    if (parsed.scheme != 'https' or parsed.hostname not in GOOGLE_HOSTS or parsed.username or parsed.password
+            or not valid_port or parsed.fragment or any(ord(c) < 32 or ord(c) == 127 for c in url)):
         raise GoogleDataError('Invalid Google service endpoint.')
+    if token and (not isinstance(token, str) or len(token) > 10000 or any(ord(c) < 33 or ord(c) == 127 for c in token)):
+        raise GoogleDataError('Invalid Google authorization token. Reconnect.')
     headers = {'Accept': 'application/json'}
     data = None
     if payload is not None:
@@ -112,10 +120,20 @@ class GoogleData:
         if not self.path.exists():
             return {}
         try:
-            if self.path.stat().st_size > 100000:
-                raise GoogleDataError('Google credentials file is too large.')
-            os.chmod(self.path, 0o600)
-            data = json.loads(self.path.read_text(encoding='utf-8'))
+            # Check the opened descriptor, not a path that can change between
+            # the symlink check and read. Nonblocking prevents FIFO hangs.
+            descriptor = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(descriptor, 'r', encoding='utf-8') as handle:
+                metadata = os.fstat(handle.fileno())
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    raise GoogleDataError('Google credentials must be a regular, unshared file.')
+                if metadata.st_size > 100000:
+                    raise GoogleDataError('Google credentials file is too large.')
+                os.fchmod(handle.fileno(), 0o600)
+                raw = handle.read(100001)
+                if len(raw) > 100000:
+                    raise GoogleDataError('Google credentials file is too large.')
+                data = json.loads(raw)
             if not isinstance(data, dict):
                 raise ValueError()
             if any(key in data and not isinstance(data[key], str) for key in ('client_id', 'client_secret', 'access_token', 'refresh_token', 'scope')):
@@ -138,7 +156,7 @@ class GoogleData:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(name, self.path)
-        os.chmod(self.path, 0o600)
+        # The replaced inode already has mode 0600; do not chmod by pathname.
 
     def configure(self, client_id, client_secret=''):
         client_id = str(client_id).strip()
@@ -310,11 +328,12 @@ class GoogleData:
         return result
 
     def _search(self, site, period, dimension=None):
+        dimensions = list(dimension) if isinstance(dimension, (list, tuple)) else ([dimension] if dimension else [])
         endpoint = 'https://www.googleapis.com/webmasters/v3/sites/' + quote(site, safe='') + '/searchAnalytics/query'
         request = {'startDate': period['start'], 'endDate': period['end'], 'type': 'web', 'dataState': 'final',
-                   'aggregationType': 'auto' if dimension == 'page' else 'byProperty', 'rowLimit': 1000, 'startRow': 0}
+                   'aggregationType': 'auto' if 'page' in dimensions else 'byProperty', 'rowLimit': 1000, 'startRow': 0}
         if dimension:
-            request['dimensions'] = [dimension]
+            request['dimensions'] = dimensions
         rows = []
         for index in range(5 if dimension else 1):
             request['startRow'] = index * 1000
@@ -322,8 +341,9 @@ class GoogleData:
             batch = response.get('rows', [])
             for row in batch[:1000]:
                 item = {key: _number(row.get(key, 0)) for key in ('clicks', 'impressions', 'ctr', 'position')}
-                if dimension:
-                    item[dimension] = str((row.get('keys') or [''])[0])
+                keys = row.get('keys') or []
+                for position, name in enumerate(dimensions):
+                    item[name] = str(keys[position]) if position < len(keys) else ''
                 rows.append(item)
             if len(batch) < 1000:
                 return rows, False
@@ -375,6 +395,14 @@ class GoogleData:
                     search[name] = {'totals': totals[0] if totals else {'clicks': 0, 'impressions': 0, 'ctr': 0, 'position': 0},
                                     'queries': queries, 'pages': pages}
                     search['limited'] = search['limited'] or q_limit or p_limit
+                    # Joint observations, never an inferred join of the two top-row lists.
+                    try:
+                        joint, joint_limit = self._search(site_url, period, ('query', 'page'))
+                        search[name]['query_pages'] = joint
+                        search['limited'] = search['limited'] or joint_limit
+                    except GoogleDataError:
+                        search[name]['query_pages'] = []
+                        result['issues'].append('Joint query/page evidence unavailable for the %s period; cannibalization cannot be measured from separate totals.' % name)
                 result['search_console'] = search
             except GoogleDataError as exc:
                 result['issues'].append(str(exc))

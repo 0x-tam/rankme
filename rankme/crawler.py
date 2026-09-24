@@ -15,6 +15,8 @@ USER_AGENT = 'RankMe/1.0 (website content inspection)'
 
 
 def normalize_url(url):
+    if any(ord(c) < 32 or ord(c) == 127 for c in str(url)):
+        raise ValueError('Invalid URL characters.')
     url = str(url).strip()
     if '://' not in url:
         url = 'https://' + url
@@ -25,7 +27,7 @@ def normalize_url(url):
     if host == 'localhost' or host.endswith(('.localhost', '.local', '.internal')) or '%' in host:
         raise ValueError('Local addresses are not allowed.')
     try:
-        if not ipaddress.ip_address(host).is_global:
+        if not _public_address(ipaddress.ip_address(host)):
             raise ValueError('Private addresses are not allowed.')
     except ValueError as exc:
         if 'not allowed' in str(exc):
@@ -43,13 +45,27 @@ def normalize_url(url):
                        quote(p.query, safe='%/:?@!$&\'()*+,;=-._~'), ''))
 
 
+def _public_address(address):
+    # Transition addresses can route to embedded private IPv4 destinations.
+    if not address.is_global or address.is_multicast or address.is_reserved:
+        return False
+    if isinstance(address, ipaddress.IPv6Address):
+        if address.ipv4_mapped is not None:
+            return _public_address(address.ipv4_mapped)
+        if address.sixtofour is not None or address.teredo is not None:
+            return False
+        if address in ipaddress.ip_network('64:ff9b::/96') or address in ipaddress.ip_network('64:ff9b:1::/48'):
+            return False
+    return True
+
+
 def _addresses(host, port):
     addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     if not addresses:
         raise ValueError('Website address could not be resolved.')
     for item in addresses:
         address = ipaddress.ip_address(item[4][0])
-        if not address.is_global or address.is_multicast:
+        if not _public_address(address):
             raise ValueError('Website resolves to a non-public address.')
     return addresses
 
@@ -57,6 +73,8 @@ def _addresses(host, port):
 def fetch_public(url, max_bytes=1500000, allowed_hosts=None):
     """Fetch HTML/text using DNS-pinned connections and validated redirects."""
     url = normalize_url(url)
+    if not isinstance(max_bytes, int) or not 1 <= max_bytes <= 10000000:
+        raise ValueError('Invalid website response size limit.')
     deadline = time.monotonic() + 45
     for _ in range(6):
         p = urlsplit(url)
@@ -138,6 +156,8 @@ class _Page(HTMLParser):
         self.description = ''
         self.hidden = 0
         self.in_title = False
+        self.canonical, self.robots, self.headings = '', [], []
+        self.heading = None
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
@@ -147,6 +167,16 @@ class _Page(HTMLParser):
             self.in_title = True
         if tag == 'meta' and a.get('name', '').lower() == 'description':
             self.description = a.get('content', '')[:1000]
+        if tag == 'meta' and a.get('name', '').lower() in ('robots', 'googlebot'):
+            self.robots.append(a.get('content', '')[:1000])
+        if tag == 'link' and 'canonical' in a.get('rel', '').lower().split() and a.get('href'):
+            try:
+                self.canonical = normalize_url(urljoin(self.base, a['href']))
+            except (ValueError, UnicodeError):
+                pass
+        if tag in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6') and len(self.headings) < 100:
+            self.heading = {'level': int(tag[1]), 'text': ''}
+            self.headings.append(self.heading)
         if tag == 'a' and a.get('href'):
             try:
                 link = normalize_url(urljoin(self.base, a['href']))
@@ -160,15 +190,19 @@ class _Page(HTMLParser):
             self.hidden = max(0, self.hidden - 1)
         if tag == 'title':
             self.in_title = False
+        if tag in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
+            self.heading = None
 
     def handle_data(self, data):
         if self.in_title:
             self.title_parts.append(data)
         if not self.hidden and data.strip():
             self.parts.append(data.strip())
+            if self.heading is not None:
+                self.heading['text'] = (self.heading['text'] + ' ' + data.strip()).strip()[:1000]
 
 
-def crawl_site(url, max_pages=24, progress=None):
+def crawl_site(url, max_pages=24, progress=None, _canonical_hops=0):
     url = normalize_url(url)
     max_pages = max(1, min(60, int(max_pages)))
     pages, issues, visited = [], [], set()
@@ -238,15 +272,20 @@ def crawl_site(url, max_pages=24, progress=None):
                 # Allow canonical www redirects for initial page only.
                 new_host = urlsplit(result['url']).hostname
                 if not pages and new_host.removeprefix('www.') == host.removeprefix('www.'):
+                    if _canonical_hops >= 2:
+                        issues.append('Website canonical redirects did not stabilize.')
+                        break
                     host = new_host
-                    return crawl_site(result['url'], max_pages, progress)
+                    return crawl_site(result['url'], max_pages, progress, _canonical_hops + 1)
                 issues.append('Skipped external redirect: ' + result['url'])
                 continue
             parser = _Page(result['url'])
             parser.feed(result['text'])
             pages.append({'url': result['url'], 'title': ' '.join(parser.title_parts)[:500],
                           'description': parser.description, 'text': '\n'.join(parser.parts)[:24000],
-                          'links': parser.links[:200]})
+                          'links': parser.links[:200], 'status': result.get('status', 200),
+                          'canonical': parser.canonical, 'robots': parser.robots[:20],
+                          'headings': parser.headings})
             candidates = [link for link in parser.links if urlsplit(link).hostname == host
                           and not urlsplit(link).query and not re.search(
                               r'\.(pdf|jpg|png|zip|mp4|css|js|webp|gif|svg)$', urlsplit(link).path, re.I)]

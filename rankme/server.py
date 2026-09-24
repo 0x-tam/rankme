@@ -44,6 +44,8 @@ class Application:
         client = self.store.put("clients", {"id": uid(), "url": url, "name": str(data.get("name") or urlparse(url).hostname)[:200],
                                             "status": "new", "profile": {}, "subject": "", "confirmed": False,
                                             "automation": False, "next_run": first_run(), "error": "",
+                                            "visibility_settings": {"enabled": True, "interval_days": 7, "max_actions": 1,
+                                                "auto_plan": False, "auto_refresh": False, "auto_research": False},
                                             "connection": {"mode": "export", "format": "md", "content_dir": "content/blog",
                                                            "auto_publish": False, "remote": "origin", "branch": "",
                                                            "project_path": "", "build_command": [], "deploy_command": [],
@@ -52,11 +54,25 @@ class Application:
         return client
 
     def update_client(self, ident, data):
+        with self.engine.guard:
+            return self._update_client(ident, data)
+
+    def _update_client(self, ident, data):
         client = self.store.get("clients", ident)
         # Pause is always available; other configuration must not change mid-job.
-        if self.busy(ident) and any(k != "automation" for k in data):
+        visibility_pause = set(data) == {"visibility_settings"} and data["visibility_settings"] == {"enabled": False}
+        if self.busy(ident) and any(k != "automation" for k in data) and not visibility_pause:
             raise ValueError("Wait for the current job to finish before changing this client")
         fields = {}
+        if "visibility_settings" in data:
+            from .autopilot import settings
+            value = data["visibility_settings"]
+            if not isinstance(value, dict):
+                raise ValueError("Visibility settings must be an object")
+            config = settings({**client.get("visibility_settings", {}), **value})
+            if any(config[k] for k in ("auto_plan", "auto_refresh", "auto_research", "auto_probe")) and not client.get("confirmed"):
+                raise ValueError("Confirm the company profile before enabling automatic research or actions")
+            fields["visibility_settings"] = config
         for key in ("name", "subject"):
             if key in data:
                 fields[key] = str(data[key]).strip()[:2000]
@@ -129,6 +145,18 @@ class Application:
             return {"token": self.token}
         if method == "GET" and path == "/api/state":
             return self.engine.state()
+        if len(parts) >= 3 and parts[:2] == ["api", "opportunities"]:
+            from .autopilot import queue_action
+            with self.engine.guard:
+                item = self.store.get("opportunities", parts[2])
+                if method == "POST" and len(parts) == 4 and parts[3] == "execute":
+                    return queue_action(self.engine, item["id"])
+                if method == "PATCH" and len(parts) == 3:
+                    if set(data) != {"status"} or data["status"] not in ("open", "dismissed"):
+                        raise ValueError("Choose open or dismissed")
+                    if self.busy(item["client_id"]) or item.get("status") in ("queued", "completed", "resolved"):
+                        raise ValueError("This opportunity cannot be changed while queued, completed or resolved")
+                    return self.store.update("opportunities", item["id"], status=data["status"], executable=data["status"] == "open")
         if path.startswith("/api/google/"):
             google = self.engine.google
             if method == "POST" and path == "/api/google/configure":
@@ -180,11 +208,19 @@ class Application:
             return result
         if len(parts) >= 3 and parts[:2] == ["api", "clients"]:
             ident = parts[2]
+            if method == "GET" and len(parts) == 4 and parts[3] == "visibility-report":
+                report = self.store.get("visibility", ident)
+                return {**report, "opportunities": [o for o in self.store.all("opportunities") if o["client_id"] == ident],
+                        "tasks": [t for t in self.store.all("tasks") if t["client_id"] == ident]}
             if method == "PATCH" and len(parts) == 3:
                 return self.update_client(ident, data)
             if method == "POST" and len(parts) == 4:
                 action = parts[3]
                 client = self.store.get("clients", ident)
+                if action in ("visibility-audit", "visibility-research", "visibility-probe"):
+                    if action != "visibility-audit" and not client.get("confirmed"):
+                        raise ValueError("Confirm the business profile before public research")
+                    return self.engine.queue(action, ident)
                 if action == "backlinks":
                     from .crawler import normalize_url
                     source = normalize_url(str(data.get("source_url", "")))

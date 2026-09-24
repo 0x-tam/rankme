@@ -1,5 +1,11 @@
 # RankMe
 
+## Visibility automation
+
+The **Visibility** tab connects public audits, Google observations, source-checked opportunity research, actual Codex answer samples, prioritized work, and protected article refreshes. Configure recurring audits, research, answer sampling, and bounded brief/refresh preparation per website. All 26 requested visibility areas are listed with honest implementation and integration status. See [visibility workflows](VISIBILITY.md) for setup and remaining capabilities, [security boundaries](SECURITY.md), and the [full target scope](AUTOMATION_SCOPE.md).
+
+This extension does not yet implement every part of that target scope: arbitrary technical edits/free-tool/infographic production need dedicated adapters, and other AI platforms and comprehensive keyword/backlink coverage require integrations. Outreach is excluded by request. The existing article generation and publishing controls remain in force.
+
 RankMe is a local, single-user workspace for producing weekly articles for your clients' coded websites. Add a website, inspect the business, confirm its profile, choose a subject, and build a connected content plan. Codex researches, drafts, reviews, and revises articles. RankMe can export the result or publish it through a configured website project.
 
 The interface, database, scheduling, and files run on your computer. AI work runs through the Codex CLI using your ChatGPT sign-in. This is not offline AI: relevant business information, source material, and article text are sent to OpenAI. Your subscription's Codex allowance applies and is shared with other Codex work. RankMe does not require an OpenAI API key and rejects API-key-only sign-in.
