@@ -96,7 +96,7 @@ class Engine:
         threading.Thread(target=self.check_status, name="rankme-codex-status", daemon=True).start()
 
     def queue(self, kind, client_id, article_id=None, **extra):
-        if kind not in ("inspect", "plan", "generate", "review", "cover", "publish", "verify", "seo-sync", "backlinks-discover", "backlink-check", "visibility-audit", "visibility-research", "visibility-action", "visibility-probe", "style", "brand-guide"):
+        if kind not in ("inspect", "plan", "generate", "review", "cover", "publish", "verify", "seo-sync", "backlinks-discover", "backlink-check", "visibility-audit", "visibility-research", "visibility-action", "visibility-probe", "style", "brand-guide", "aio-collect", "evidence-audit"):
             raise ValueError("Unknown job type")
         self.store.get("clients", client_id)
         with self.guard:
@@ -132,7 +132,7 @@ class Engine:
             return job
 
     STOPPABLE_WHILE_RUNNING = ("inspect", "plan", "generate", "review", "cover", "seo-sync", "backlinks-discover", "backlink-check",
-                               "visibility-audit", "visibility-research", "visibility-action", "visibility-probe", "style", "brand-guide")
+                               "visibility-audit", "visibility-research", "visibility-action", "visibility-probe", "style", "brand-guide", "aio-collect", "evidence-audit")
 
     def stop(self, ident):
         """Stop a queued or running job and return its article or website to a state the user can act on."""
@@ -243,7 +243,7 @@ class Engine:
                 continue
             if due > current:
                 continue
-            if any(j["client_id"] == client["id"] and (j["status"] in ("queued", "running") or (j["status"] == "failed" and j["kind"] not in ("seo-sync", "backlinks-discover", "backlink-check", "visibility-audit", "visibility-research", "visibility-action", "visibility-probe", "style", "brand-guide"))) for j in self.store.all("jobs")):
+            if any(j["client_id"] == client["id"] and (j["status"] in ("queued", "running") or (j["status"] == "failed" and j["kind"] not in ("seo-sync", "backlinks-discover", "backlink-check", "visibility-audit", "visibility-research", "visibility-action", "visibility-probe", "style", "brand-guide", "aio-collect", "evidence-audit"))) for j in self.store.all("jobs")):
                 continue
             planned = [a for a in self.articles(client["id"]) if a["status"] == "planned"]
             if planned:
@@ -276,6 +276,28 @@ class Engine:
         for client in self.store.all("clients"):
             if any(j["client_id"] == client["id"] and j["status"] in ("queued", "running") for j in self.store.all("jobs")):
                 continue
+            from .seo_features import aio_settings
+            aio = aio_settings(client.get("aio_settings"))
+            if aio["enabled"] and aio["queries"]:
+                last_aio = client.get("aio_attempt_at")
+                try:
+                    aio_due = not last_aio or (current - parse_date(last_aio)).total_seconds() >= aio["interval_days"] * 86400
+                except (TypeError, ValueError):
+                    aio_due = True
+                if aio_due:
+                    self.queue("aio-collect", client["id"], scheduled=True)
+                    continue
+            from .seo_features import growth_settings
+            growth = growth_settings(client.get("growth_settings"))
+            if growth["enabled"]:
+                last_audit = client.get("evidence_audit_attempt_at")
+                try:
+                    audit_due = not last_audit or (current - parse_date(last_audit)).total_seconds() >= growth["interval_days"] * 86400
+                except (TypeError, ValueError):
+                    audit_due = True
+                if audit_due:
+                    self.queue("evidence-audit", client["id"], scheduled=True)
+                    continue
             connection = client.get("seo_connection", {})
             last = client.get("seo_attempt_at")
             if connection.get("auto_sync", True) and connection.get("site_url") and self.google.status().get("connected") and (not last or (current - parse_date(last)).total_seconds() >= 86400):
@@ -339,6 +361,60 @@ class Engine:
             if job["kind"].startswith("visibility-"):
                 from .autopilot import execute as visibility_execute
                 visibility_execute(self, job, progress)
+            elif job["kind"] == "aio-collect":
+                from .ai_overviews import AIOCollector
+                from .seo_features import aio_settings
+                config = aio_settings(client.get("aio_settings"))
+                if job.get("scheduled") and not config["enabled"]:
+                    raise ValueError("AI Overview monitoring was disabled before execution")
+                if not config["queries"]:
+                    raise ValueError("Configure a query before collecting AI Overviews")
+                self.store.update("clients", client_id, aio_attempt_at=now())
+                collector = AIOCollector(self.data_dir)
+                outcomes = []
+                for query in config["queries"]:
+                    progress("Checking Google AI Overview for “" + query[:80] + "”")
+                    outcome = collector.collect_browser(client_id, query, country=config["country"], language=config["language"],
+                                                        location=config["location"], device=config["device"])
+                    outcomes.append(outcome)
+                good = sum(item.get("status") in ("present", "absent") for item in outcomes)
+                failed = [item for item in outcomes if item.get("status") not in ("present", "absent")]
+                if not good:
+                    raise ValueError("No AI Overview observation completed: " + ", ".join(sorted({str(item.get("reason") or item.get("status")) for item in failed}))[:400])
+                self.store.update("clients", client_id, aio_error=(str(len(failed)) + " of " + str(len(outcomes)) + " checks unavailable; review their saved reasons.") if failed else "")
+                from .autopilot import rebuild
+                rebuild(self, client_id)
+            elif job["kind"] == "evidence-audit":
+                from .crawler import crawl_site
+                from .evidence_audit import build_audit, fetch_page_speed, enrich_actions_with_jev
+                from .seo_features import growth_settings
+                if job.get("scheduled") and not growth_settings(client.get("growth_settings"))["enabled"]:
+                    raise ValueError("Growth audits were disabled before execution")
+                self.store.update("clients", client_id, evidence_audit_attempt_at=now())
+                progress("Checking the public website and evidence for article decisions")
+                crawl = crawl_site(client["url"], max_pages=self.store.settings()["max_pages"], progress=progress)
+                if not crawl.get("pages"):
+                    raise ValueError("No readable pages found; previous audit was preserved")
+                crawl["observed_at"] = now()
+                try:
+                    seo = self.store.get("seo", client_id)
+                except KeyError:
+                    seo = {}
+                progress("Reading public PageSpeed measurements when available")
+                try:
+                    page_speed = fetch_page_speed(client["url"])
+                except (OSError, ValueError, KeyError, TimeoutError):
+                    page_speed = None
+                experience = [r for r in self.store.all("experience_claims") if r["client_id"] == client_id]
+                audit = build_audit(client, crawl, seo=seo, articles=self.articles(client_id),
+                                    page_speed=page_speed, experience=experience)
+                audit = enrich_actions_with_jev(audit, enabled=growth_settings(client.get("growth_settings"))["jev_enabled"])
+                self.store.put("evidence_audits", {"id": client_id, "client_id": client_id, "audit": audit,
+                                                    "observed_at": now(), "source": "local_public_crawl_and_connected_data"})
+                self.store.update("clients", client_id, crawl=crawl, crawl_observed_at=now(), evidence_audit_error="")
+                from .autopilot import rebuild
+                rebuild(self, client_id)
+                self.store.event("Evidence audit ready", client_id)
             elif job["kind"] == "seo-sync":
                 self.store.update("clients", client_id, seo_attempt_at=now())
                 connection = client.get("seo_connection", {})
@@ -413,6 +489,19 @@ class Engine:
                     client = {**client, "seo_evidence": evidence}
                 except KeyError:
                     pass
+                from .seo_features import confirmed_experience, aio_settings
+                from .ai_overviews import AIOCollector, build_ai_overview_brief
+                aio_config = aio_settings(client.get("aio_settings"))
+                collector = AIOCollector(self.data_dir)
+                aio_evidence = []
+                for query in aio_config["queries"]:
+                    summary = collector.summarize(client_id, query, country=aio_config["country"], language=aio_config["language"],
+                                                  location=aio_config["location"], device=aio_config["device"], days=30)
+                    if summary.get("enough_history"):
+                        aio_evidence.append({"query": query, "basis_source": summary.get("basis_source"),
+                                             "sample_days": summary.get("sample_days"), "brief": build_ai_overview_brief(summary)})
+                client = {**client, "experience_evidence": confirmed_experience(self.store, client_id),
+                          "aio_evidence": aio_evidence[:6]}
                 plan = ai.plan_articles(self.runner(), client, existing, progress=progress)
                 items = plan.get("articles", [])
                 if not items or len(items) > 12:
@@ -455,7 +544,9 @@ class Engine:
                     if job["kind"] == "generate":
                         self.store.update("articles", article_id, status="writing", error="")
                         progress("Researching and writing" if not attempt else "Repairing review findings")
-                        draft = ai.write_article(runner, client, article, existing, feedback=feedback, progress=progress)
+                        from .seo_features import confirmed_experience
+                        writing_client = {**client, "experience_evidence": confirmed_experience(self.store, client_id)}
+                        draft = ai.write_article(runner, writing_client, article, existing, feedback=feedback, progress=progress)
                         allowed = {k: draft[k] for k in ("title", "slug", "description", "body", "sources", "claims", "internal_links") if k in draft}
                         if article.get("refresh_of"):
                             allowed["slug"] = original["slug"]
@@ -464,7 +555,8 @@ class Engine:
                     self.store.update("articles", article_id, status="reviewing")
                     progress("Checking claims, sources, relevance, and article structure")
                     checks = check_article(article, client, existing)
-                    review = ai.review_article(runner, client, article, progress=progress)
+                    from .seo_features import confirmed_experience
+                    review = ai.review_article(runner, {**client, "experience_evidence": confirmed_experience(self.store, client_id)}, article, progress=progress)
                     passed = checks["passed"] and review.get("passed") is True and not review.get("issues")
                     article = self.store.update("articles", article_id, checks=checks, review=review,
                                                 reviewed_digest=content_digest(article) if passed else "",
@@ -574,6 +666,10 @@ class Engine:
             self.store.update("jobs", job["id"], status="failed", stage="Needs attention", finished_at=now(), error=message)
             if job["kind"] == "seo-sync":
                 self.store.update("clients", client_id, seo_error=message)
+            if job["kind"] == "aio-collect":
+                self.store.update("clients", client_id, aio_error=message)
+            if job["kind"] == "evidence-audit":
+                self.store.update("clients", client_id, evidence_audit_error=message)
             if job["kind"].startswith("visibility-"):
                 self.store.update("clients", client_id, visibility_error=message)
                 if job.get("opportunity_id"):
@@ -731,6 +827,26 @@ class Engine:
                             seo_by_client.get(r["client_id"], {}))} for r in self.store.all("visibility")]
         jobs = sorted(self.store.all("jobs"), key=lambda j: j["created_at"], reverse=True)[:150]
         events = sorted(self.store.all("events"), key=lambda j: j["created_at"], reverse=True)[:200]
+        from .ai_overviews import AIOCollector, build_ai_overview_brief
+        from .seo_features import aio_settings
+        collector = AIOCollector(self.data_dir)
+        aio_status = collector.browser_readiness()
+        aio_summaries = []
+        for client in clients:
+            config = aio_settings(client.get("aio_settings"))
+            for query in config["queries"]:
+                summary = collector.summarize(client["id"], query, country=config["country"], language=config["language"],
+                                              location=config["location"], device=config["device"], days=30)
+                aio_summaries.append({"client_id": client["id"], "query": query,
+                    "summary": {**summary, "citations": [{k: c.get(k) for k in ("url", "domain", "title", "days_cited", "frequency")}
+                                                          for c in summary.get("citations", [])[:5]],
+                                "citation_changes": [{"from_date": x.get("from_date"), "to_date": x.get("to_date"),
+                                    "added": x.get("added", [])[:5], "lost": x.get("lost", [])[:5]}
+                                    for x in summary.get("citation_changes", [])[-3:]],
+                                "common_terms": summary.get("common_terms", [])[:10],
+                                "daily_evidence": [{**day, "answer": day.get("answer", "")[:300]}
+                                                   for day in summary.get("daily_evidence", [])[-7:]]},
+                    "brief": build_ai_overview_brief(summary) if summary.get("enough_history") else {"status": "insufficient_evidence"}})
         return {"clients": clients, "articles": articles, "jobs": jobs, "events": events,
                 "settings": self.store.settings(), "status": self.codex_status,
                 "google": self.google.status(), "vercel": self.vercel.status(), "seo": seo, "backlinks": self.store.all("backlinks"),
@@ -738,4 +854,9 @@ class Engine:
                 "tasks": self.store.all("tasks"), "research": self.store.all("research"),
                 "measurements": [r for c in clients for r in self.store.history(c["id"], 20)],
                 "measurement_counts": self.store.history_counts(), "experiments": self.store.all("experiments"),
+                "aio_status": aio_status, "aio_summaries": aio_summaries,
+                "evidence_audits": [{"id": r["id"], "client_id": r["client_id"], "observed_at": r.get("observed_at"),
+                    "audit": {"summary": (r.get("audit") or {}).get("summary"),
+                              "actions": (r.get("audit") or {}).get("actions", [])[:20]}} for r in self.store.all("evidence_audits")],
+                "experience_claims": self.store.all("experience_claims"),
                 "server": {"version": "1.0.0", "local": True}}

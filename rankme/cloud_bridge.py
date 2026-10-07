@@ -37,7 +37,7 @@ def allowed_command(method, path, body):
     if method == "POST" and path == "/api/clients":
         return fields <= {"url", "name"} and isinstance(body.get("url"), str)
     if method == "PATCH" and re.fullmatch(rf"/api/clients/{ID}", path):
-        if not fields or not fields <= {"name", "subject", "profile", "confirmed", "automation", "next_run", "seo_connection", "visibility_settings", "image_brand", "conversion_goal"}:
+        if not fields or not fields <= {"name", "subject", "profile", "confirmed", "automation", "next_run", "seo_connection", "visibility_settings", "image_brand", "conversion_goal", "aio_settings", "growth_settings"}:
             return False
         if "profile" in body and (not isinstance(body["profile"], dict) or any(SENSITIVE.search(k) for k in body["profile"])):
             return False
@@ -45,7 +45,25 @@ def allowed_command(method, path, body):
             return False
         if "visibility_settings" in body and (not isinstance(body["visibility_settings"], dict) or set(body["visibility_settings"]) - {"enabled", "interval_days", "max_actions", "auto_plan", "auto_refresh", "auto_research", "auto_probe"}):
             return False
+        if "aio_settings" in body and (not isinstance(body["aio_settings"], dict) or set(body["aio_settings"]) - {"enabled", "interval_days", "queries", "country", "language", "location", "device"}):
+            return False
+        if "aio_settings" in body:
+            from .seo_features import aio_settings
+            try:
+                aio_settings(body["aio_settings"])
+            except ValueError:
+                return False
+        if "growth_settings" in body:
+            from .seo_features import growth_settings
+            try:
+                growth_settings(body["growth_settings"])
+            except ValueError:
+                return False
         return True
+    if method == "PATCH" and re.fullmatch(rf"/api/experience/{ID}/edit", path):
+        return bool(fields) and fields <= {"claim", "source_url", "source_note", "confirmed"} and all(
+            isinstance(body[k], str) and len(body[k]) <= {"claim": 2000, "source_url": 2000, "source_note": 1000}[k]
+            for k in fields - {"confirmed"}) and ("confirmed" not in body or type(body["confirmed"]) is bool)
     if method == "PATCH" and re.fullmatch(rf"/api/articles/{ID}", path):
         return bool(fields) and fields <= {"body", "title", "description", "scheduled_at"}
     if method == "PATCH" and re.fullmatch(rf"/api/backlinks/{ID}", path):
@@ -57,7 +75,8 @@ def allowed_command(method, path, body):
     if method != "POST":
         return False
     patterns = (
-        (rf"/api/clients/{ID}/(?:inspect|run|visibility-audit|visibility-research|visibility-probe|seo-sync|backlinks-discover)", set()),
+        (rf"/api/clients/{ID}/(?:inspect|run|visibility-audit|visibility-research|visibility-probe|seo-sync|backlinks-discover|aio-collect|evidence-audit)", set()),
+        (rf"/api/experience/{ID}/remove", set()),
         (rf"/api/clients/{ID}/plan", {"subject"}),
         (rf"/api/clients/{ID}/backlinks", {"source_url", "notes"}),
         (rf"/api/clients/{ID}/experiments", {"page_url", "hypothesis", "change"}),
@@ -70,6 +89,18 @@ def allowed_command(method, path, body):
     # Removing a website needs the typed address; the Mac checks it again before deleting anything.
     if re.fullmatch(rf"/api/clients/{ID}/remove", path):
         return fields == {"confirm"} and isinstance(body["confirm"], str) and 0 < len(body["confirm"]) <= 300
+    if re.fullmatch(rf"/api/clients/{ID}/aio-import", path):
+        if fields != {"observation"} or not isinstance(body["observation"], dict):
+            return False
+        observation = body["observation"]
+        return set(observation) <= {"query", "country", "language", "location", "device", "observed_at", "status", "answer", "citations", "evidence_url", "evidence_note"}
+    if re.fullmatch(rf"/api/clients/{ID}/experience", path):
+        return fields <= {"claim", "source_url", "source_note", "confirmed"} and isinstance(body.get("claim"), str) and 10 <= len(body["claim"].strip()) <= 2000 and all(
+            isinstance(body.get(k, ""), str) and len(body.get(k, "")) <= limit for k, limit in (("source_url", 2000), ("source_note", 1000))) and type(body.get("confirmed", False)) is bool
+    if re.fullmatch(rf"/api/clients/{ID}/evidence-report", path):
+        return fields == {"format"} and body["format"] in ("md", "pdf", "xlsx")
+    if re.fullmatch(rf"/api/clients/{ID}/aio-history", path):
+        return fields == {"query"} and isinstance(body["query"], str) and 2 <= len(body["query"].strip()) <= 200
     return any(re.fullmatch(pattern, path) and fields <= permitted for pattern, permitted in patterns)
 
 

@@ -16,7 +16,7 @@ def uid():
 
 
 class Store:
-    TABLES = {"clients", "articles", "jobs", "events", "seo", "backlinks", "visibility", "opportunities", "research", "tasks", "answer_probes", "measurements", "experiments"}
+    TABLES = {"clients", "articles", "jobs", "events", "seo", "backlinks", "visibility", "opportunities", "research", "tasks", "answer_probes", "measurements", "experiments", "evidence_audits", "experience_claims"}
 
     def __init__(self, path):
         self.path = Path(path)

@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 const root = resolve(import.meta.dirname, '..');
 const stage = resolve(root, '.vercel-stage');
 const output = resolve(root, 'dist/public');
-const assets = ['index.html', 'static/app.js', 'static/auth.js', 'static/styles.css', 'static/favicon.svg'];
+const assets = ['index.html', 'static/app.js', 'static/seo-features.js', 'static/auth.js', 'static/styles.css', 'static/favicon.svg'];
 
 // Rebuild and seal the exact public artifact before a deploy command can read it.
 await import('./build-web.mjs');
@@ -31,6 +31,13 @@ await writeFile(resolve(stage, 'vercel.json'), JSON.stringify({
   outputDirectory: 'public',
 }, null, 2) + '\n');
 for (const asset of assets) await cp(resolve(output, asset), resolve(stage, 'public', asset));
+
+const html = await readFile(resolve(stage, 'public/index.html'), 'utf8');
+const referencedAssets = [...html.matchAll(/(?:src|href)=["'](\/static\/[^"']+)["']/g)]
+  .map((match) => match[1].slice(1));
+for (const asset of referencedAssets) {
+  if (!assets.includes(asset)) throw Error(`Referenced public asset is missing from Vercel stage: ${asset}`);
+}
 
 const actual = (await readdir(stage, { recursive: true })).filter(name =>
   !['.vercel', 'public', 'public/static'].includes(name)).sort();

@@ -58,6 +58,8 @@ class Application:
         client = self.store.put("clients", {"id": uid(), "url": url, "name": str(data.get("name") or urlparse(url).hostname)[:200],
                                             "status": "new", "profile": {}, "subject": "", "confirmed": False,
                                             "automation": False, "next_run": first_run(), "error": "",
+                                            "aio_settings": {"enabled": False, "interval_days": 1, "queries": [], "country": "us", "language": "en", "location": "", "device": "desktop"},
+                                            "growth_settings": {"enabled": False, "interval_days": 1, "jev_enabled": False},
                                             "visibility_settings": {"enabled": True, "interval_days": 7, "max_actions": 1,
                                                 "auto_plan": False, "auto_refresh": False, "auto_research": False},
                                             "connection": {"mode": "export", "format": "md", "content_dir": "content/blog",
@@ -75,7 +77,9 @@ class Application:
         client = self.store.get("clients", ident)
         # Pause is always available; other configuration must not change mid-job.
         visibility_pause = set(data) == {"visibility_settings"} and data["visibility_settings"] == {"enabled": False}
-        if self.busy(ident) and any(k != "automation" for k in data) and not visibility_pause:
+        aio_pause = set(data) == {"aio_settings"} and data["aio_settings"] == {"enabled": False}
+        growth_pause = set(data) == {"growth_settings"} and data["growth_settings"] == {"enabled": False}
+        if self.busy(ident) and any(k != "automation" for k in data) and not visibility_pause and not aio_pause and not growth_pause:
             raise ValueError("Wait for the current job to finish before changing this client")
         fields = {}
         if "conversion_goal" in data:
@@ -94,6 +98,22 @@ class Application:
             if any(config[k] for k in ("auto_plan", "auto_refresh", "auto_research", "auto_probe")) and not client.get("confirmed"):
                 raise ValueError("Confirm the company profile before enabling automatic research or actions")
             fields["visibility_settings"] = config
+        if "aio_settings" in data:
+            from .seo_features import aio_settings
+            if not isinstance(data["aio_settings"], dict):
+                raise ValueError("AI Overview settings must be an object")
+            config = aio_settings({**client.get("aio_settings", {}), **data["aio_settings"]})
+            if config != client.get("aio_settings"):
+                fields["aio_attempt_at"] = ""
+            fields["aio_settings"] = config
+        if "growth_settings" in data:
+            from .seo_features import growth_settings
+            if not isinstance(data["growth_settings"], dict):
+                raise ValueError("Growth settings must be an object")
+            config = growth_settings({**client.get("growth_settings", {}), **data["growth_settings"]})
+            if config != client.get("growth_settings"):
+                fields["evidence_audit_attempt_at"] = ""
+            fields["growth_settings"] = config
         for key in ("name", "subject"):
             if key in data:
                 fields[key] = str(data[key]).strip()[:2000]
@@ -303,6 +323,9 @@ class Application:
             if self.busy(ident):
                 raise ValueError("Wait for this website's current job to finish, or pause it, before removing the website")
             article_ids = [a["id"] for a in self.store.all("articles") if a.get("client_id") == ident]
+            from .ai_overviews import AIOCollector
+            # Keep the client addressable if its separate observation store cannot be cleaned.
+            AIOCollector(self.data_dir).delete_client(ident)
             self.store.delete_client(ident)
         root = self.data_dir.resolve()
         folders = [root / "brand" / ident, root / "sites" / ident, root / "exports" / ident]
@@ -360,6 +383,14 @@ class Application:
         parts = path.strip("/").split("/")
         if method == "GET" and path == "/api/state":
             return self.engine.state()
+        if len(parts) == 4 and parts[:2] == ["api", "experience"]:
+            from .seo_features import update_experience
+            claim = self.store.get("experience_claims", parts[2])
+            if method == "PATCH" and parts[3] == "edit":
+                return update_experience(self.store, claim["id"], data)
+            if method == "POST" and parts[3] == "remove" and not data:
+                self.store.delete("experience_claims", claim["id"])
+                return {"ok": True}
         if method == "POST" and len(parts) == 4 and parts[:2] == ["api", "experiments"] and parts[3] == "cancel":
             from .measurement import cancel
             return cancel(self.engine, parts[2])
@@ -457,6 +488,53 @@ class Application:
             if method == "POST" and len(parts) == 4:
                 action = parts[3]
                 client = self.store.get("clients", ident)
+                if action == "aio-import":
+                    from .ai_overviews import AIOCollector
+                    from .seo_features import aio_settings
+                    config = aio_settings(client.get("aio_settings"))
+                    if not isinstance(data.get("observation"), dict) or set(data) != {"observation"}:
+                        raise ValueError("Provide one manual observation")
+                    observation = {**data["observation"]}
+                    if observation.get("query") not in config["queries"] or any(observation.get(k) != config[k] for k in ("country", "language", "location", "device")):
+                        raise ValueError("Manual observation must match a configured query and locale")
+                    return AIOCollector(self.data_dir).import_observation(ident, observation)
+                if action == "aio-history":
+                    import base64
+                    from .ai_overviews import AIOCollector
+                    from .seo_features import aio_settings
+                    config = aio_settings(client.get("aio_settings"))
+                    if set(data) != {"query"} or data["query"] not in config["queries"]:
+                        raise ValueError("Choose a configured query")
+                    records = AIOCollector(self.data_dir).history(ident, data["query"], country=config["country"],
+                        language=config["language"], location=config["location"], device=config["device"], limit=90)
+                    content = json.dumps({"query": data["query"], "cohort": {k: config[k] for k in ("country", "language", "location", "device")},
+                                          "observations": records}, ensure_ascii=False).encode("utf-8")
+                    encoded = base64.b64encode(content).decode("ascii")
+                    if len(encoded) > 400_000:
+                        raise ValueError("History exceeds the protected download limit")
+                    return {"filename": "rankme-ai-overview-" + ident + ".json", "content_type": "application/json", "base64": encoded}
+                if action == "evidence-report":
+                    import base64
+                    from .evidence_audit import render_report
+                    if set(data) != {"format"} or data["format"] not in ("md", "pdf", "xlsx"):
+                        raise ValueError("Choose Markdown, PDF, or spreadsheet")
+                    audit = self.store.get("evidence_audits", ident)["audit"]
+                    raw = render_report(audit, data["format"])
+                    if isinstance(raw, str):
+                        raw = raw.encode("utf-8")
+                    encoded = base64.b64encode(raw).decode("ascii")
+                    if len(encoded) > 400_000:
+                        raise ValueError("Report exceeds the protected download limit")
+                    return {"filename": "rankme-evidence-" + ident + "." + data["format"],
+                            "content_type": {"md": "text/markdown", "pdf": "application/pdf", "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}[data["format"]],
+                            "base64": encoded}
+                if action == "experience":
+                    from .seo_features import create_experience
+                    return create_experience(self.store, ident, data)
+                if action in ("aio-collect", "evidence-audit"):
+                    if data:
+                        raise ValueError("This action takes no fields")
+                    return self.engine.queue(action, ident)
                 if action == "experiments":
                     from .measurement import start
                     with self.engine.guard:
@@ -778,8 +856,8 @@ def handler_for(app):
                     return self.send(200, app.dispatch(method, path, data))
                 if method != "GET":
                     raise KeyError("Endpoint not found")
-                names = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/auth.js": "auth.js", "/styles.css": "styles.css", "/favicon.svg": "favicon.svg"}
-                names.update({"/static/" + name: name for name in ("app.js", "auth.js", "styles.css", "favicon.svg")})
+                names = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/seo-features.js": "seo-features.js", "/auth.js": "auth.js", "/styles.css": "styles.css", "/favicon.svg": "favicon.svg"}
+                names.update({"/static/" + name: name for name in ("app.js", "seo-features.js", "auth.js", "styles.css", "favicon.svg")})
                 if path not in names:
                     raise KeyError("Page not found")
                 file = ROOT / "static" / names[path]

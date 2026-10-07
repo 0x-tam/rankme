@@ -129,3 +129,23 @@ button:disabled{cursor:not-allowed}
 .danger-zone{border-top:1px solid #f3d3da;padding-top:18px}
 .remove-summary{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
 @media(max-width:720px){.remove-summary{grid-template-columns:minmax(0,1fr)}}
+
+/* Evidence, monitoring, and owner-confirmed facts share the existing card rhythm. */
+.seo-feature-card{min-width:0}
+.seo-feature-card .card-head{align-items:flex-start;flex-wrap:wrap}
+.seo-feature-card .card-head>div{max-width:720px}
+.seo-feature-card .card-head p{margin-top:5px}
+.seo-feature-card .disclosure{margin-top:18px}
+.seo-feature-card .disclosure>summary{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.seo-evidence-list{margin-top:14px;border-top:1px solid var(--line)}
+.seo-evidence-row{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;padding:16px 0;border-bottom:1px solid var(--line);overflow-wrap:anywhere}
+.seo-evidence-row>div:first-child{min-width:0}
+.seo-evidence-row strong{display:block;font-size:14px;line-height:1.5}
+.seo-evidence-row small{display:block;color:var(--muted);font-size:12px;line-height:1.5;margin-top:3px}
+.seo-evidence-row a{font-size:12px;overflow-wrap:anywhere}
+.seo-day-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(175px,1fr));gap:10px;margin-top:18px}
+.seo-day-grid>div{min-width:0;border:1px solid var(--line);border-radius:9px;padding:12px;background:#f9fbff}
+.seo-day-grid strong,.seo-day-grid small{display:block}
+.seo-day-grid .badge{margin:6px 0}
+.seo-day-grid p{font-size:12px;line-height:1.6;max-height:140px;overflow:auto;overflow-wrap:anywhere}
+@media(max-width:720px){.seo-evidence-row{flex-wrap:wrap}.seo-evidence-row .actions{width:100%}.seo-feature-card .card-head .actions{width:100%}}

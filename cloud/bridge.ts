@@ -31,12 +31,35 @@ export function allowedCommand(method: string, path: string, value: unknown): bo
   const body = value;
   if (method === 'POST' && path === '/api/clients') return fieldsOnly(body, ['url', 'name']) && typeof body.url === 'string';
   if (method === 'PATCH' && new RegExp(`^/api/clients/${ID}$`).test(path)) {
-    if (!fieldsOnly(body, ['name', 'subject', 'profile', 'confirmed', 'automation', 'next_run', 'seo_connection', 'visibility_settings', 'image_brand', 'conversion_goal'], true)) return false;
+    if (!fieldsOnly(body, ['name', 'subject', 'profile', 'confirmed', 'automation', 'next_run', 'seo_connection', 'visibility_settings', 'image_brand', 'conversion_goal', 'aio_settings', 'growth_settings'], true)) return false;
     if (body.profile !== undefined && (!object(body.profile) || Object.keys(body.profile).some(key => SECRET_KEY.test(key)))) return false;
     if (body.seo_connection !== undefined && (!object(body.seo_connection) || !fieldsOnly(body.seo_connection, ['site_url', 'ga4_property', 'auto_sync']))) return false;
     if (body.visibility_settings !== undefined && (!object(body.visibility_settings) || !fieldsOnly(body.visibility_settings, ['enabled', 'interval_days', 'max_actions', 'auto_plan', 'auto_refresh', 'auto_research', 'auto_probe']))) return false;
+    if (body.aio_settings !== undefined) {
+      if (!object(body.aio_settings) || !fieldsOnly(body.aio_settings, ['enabled', 'interval_days', 'queries', 'country', 'language', 'location', 'device'])) return false;
+      const s = body.aio_settings;
+      if (s.enabled !== undefined && typeof s.enabled !== 'boolean') return false;
+      if (s.interval_days !== undefined && (!Number.isInteger(s.interval_days) || Number(s.interval_days) < 1 || Number(s.interval_days) > 30)) return false;
+      if (s.queries !== undefined && (!Array.isArray(s.queries) || s.queries.length > 10 || s.queries.some(q => typeof q !== 'string' || q.trim().length < 2 || q.length > 200))) return false;
+      if (s.country !== undefined && (typeof s.country !== 'string' || !/^[a-zA-Z]{2}$/.test(s.country))) return false;
+      if (s.language !== undefined && (typeof s.language !== 'string' || !/^[a-zA-Z]{2}$/.test(s.language))) return false;
+      if (s.location !== undefined && (typeof s.location !== 'string' || s.location.length > 100)) return false;
+      if (s.device !== undefined && !['desktop', 'mobile', 'tablet'].includes(String(s.device))) return false;
+    }
+    if (body.growth_settings !== undefined) {
+      if (!object(body.growth_settings) || !fieldsOnly(body.growth_settings, ['enabled', 'interval_days', 'jev_enabled'])) return false;
+      const s = body.growth_settings;
+      if (s.enabled !== undefined && typeof s.enabled !== 'boolean') return false;
+      if (s.jev_enabled !== undefined && typeof s.jev_enabled !== 'boolean') return false;
+      if (s.interval_days !== undefined && (!Number.isInteger(s.interval_days) || Number(s.interval_days) < 1 || Number(s.interval_days) > 30)) return false;
+    }
     return true;
   }
+  if (method === 'PATCH' && new RegExp(`^/api/experience/${ID}/edit$`).test(path)) return fieldsOnly(body, ['claim', 'source_url', 'source_note', 'confirmed'], true)
+    && (body.claim === undefined || typeof body.claim === 'string' && body.claim.length <= 2000)
+    && (body.source_url === undefined || typeof body.source_url === 'string' && body.source_url.length <= 2000)
+    && (body.source_note === undefined || typeof body.source_note === 'string' && body.source_note.length <= 1000)
+    && (body.confirmed === undefined || typeof body.confirmed === 'boolean');
   if (method === 'PATCH' && new RegExp(`^/api/articles/${ID}$`).test(path)) return fieldsOnly(body, ['body', 'title', 'description', 'scheduled_at'], true);
   if (method === 'PATCH' && new RegExp(`^/api/backlinks/${ID}$`).test(path)) return fieldsOnly(body, ['status', 'notes'], true);
   if (method === 'PATCH' && new RegExp(`^/api/opportunities/${ID}$`).test(path)) return Object.keys(body).length === 1 && ['open', 'dismissed'].includes(String(body.status));
@@ -47,7 +70,8 @@ export function allowedCommand(method: string, path: string, value: unknown): bo
     return Object.keys(body).length === 1 && typeof body.confirm === 'string' && body.confirm.length > 0 && body.confirm.length <= 300;
   }
   const routes: [RegExp, string[]][] = [
-    [new RegExp(`^/api/clients/${ID}/(?:inspect|run|visibility-audit|visibility-research|visibility-probe|seo-sync|backlinks-discover)$`), []],
+    [new RegExp(`^/api/clients/${ID}/(?:inspect|run|visibility-audit|visibility-research|visibility-probe|seo-sync|backlinks-discover|aio-collect|evidence-audit)$`), []],
+    [new RegExp(`^/api/experience/${ID}/remove$`), []],
     [new RegExp(`^/api/clients/${ID}/plan$`), ['subject']],
     [new RegExp(`^/api/clients/${ID}/backlinks$`), ['source_url', 'notes']],
     [new RegExp(`^/api/clients/${ID}/experiments$`), ['page_url', 'hypothesis', 'change']],
@@ -57,6 +81,23 @@ export function allowedCommand(method: string, path: string, value: unknown): bo
     [new RegExp(`^/api/experiments/${ID}/cancel$`), []],
     [new RegExp(`^/api/jobs/${ID}/(?:retry|stop|dismiss)$`), []],
   ];
+  if (new RegExp(`^/api/clients/${ID}/aio-import$`).test(path)) {
+    return Object.keys(body).length === 1 && object(body.observation)
+      && fieldsOnly(body.observation, ['query', 'country', 'language', 'location', 'device', 'observed_at', 'status', 'answer', 'citations', 'evidence_url', 'evidence_note']);
+  }
+  if (new RegExp(`^/api/clients/${ID}/experience$`).test(path)) {
+    return fieldsOnly(body, ['claim', 'source_url', 'source_note', 'confirmed'])
+      && typeof body.claim === 'string' && body.claim.trim().length >= 10 && body.claim.length <= 2000
+      && (body.source_url === undefined || typeof body.source_url === 'string' && body.source_url.length <= 2000)
+      && (body.source_note === undefined || typeof body.source_note === 'string' && body.source_note.length <= 1000)
+      && (body.confirmed === undefined || typeof body.confirmed === 'boolean');
+  }
+  if (new RegExp(`^/api/clients/${ID}/evidence-report$`).test(path)) {
+    return Object.keys(body).length === 1 && ['md', 'pdf', 'xlsx'].includes(String(body.format));
+  }
+  if (new RegExp(`^/api/clients/${ID}/aio-history$`).test(path)) {
+    return Object.keys(body).length === 1 && typeof body.query === 'string' && body.query.trim().length >= 2 && body.query.length <= 200;
+  }
   return routes.some(([route, fields]) => route.test(path) && fieldsOnly(body, fields));
 }
 

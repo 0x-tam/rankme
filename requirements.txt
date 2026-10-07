@@ -2,3 +2,5 @@ fido2==2.2.1
 cryptography==50.0.1
 cffi==2.1.1
 pycparser==3.0
+playwright==1.63.0
+reportlab==4.4.9

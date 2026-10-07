@@ -18,6 +18,16 @@ test('cloud mutation allowlist mirrors local worker', () => {
   assert.equal(allowedCommand('POST', `/api/clients/${id}/remove`, { confirm: 'eoncoatings.com' }), true);
   assert.equal(allowedCommand('POST', `/api/clients/${id}/remove`, {}), false);
   assert.equal(allowedCommand('POST', `/api/clients/${id}/remove`, { confirm: 'x.com', extra: 1 }), false);
+  assert.equal(allowedCommand('POST', `/api/clients/${id}/aio-collect`, {}), true);
+  assert.equal(allowedCommand('POST', `/api/clients/${id}/evidence-audit`, { force: true }), false);
+  assert.equal(allowedCommand('POST', `/api/clients/${id}/evidence-report`, { format: 'pdf' }), true);
+  assert.equal(allowedCommand('POST', `/api/clients/${id}/evidence-report`, { format: 'html' }), false);
+  assert.equal(allowedCommand('POST', `/api/clients/${id}/aio-history`, { query: 'solar maintenance' }), true);
+  assert.equal(allowedCommand('POST', `/api/clients/${id}/aio-history`, { query: 'solar maintenance', allClients: true }), false);
+  assert.equal(allowedCommand('POST', `/api/clients/${id}/experience`, { claim: 'A confirmed first-hand service fact.', source_note: 'Owner records', confirmed: true }), true);
+  assert.equal(allowedCommand('PATCH', `/api/clients/${id}`, { growth_settings: { enabled: true, interval_days: 1, jev_enabled: false } }), true);
+  assert.equal(allowedCommand('PATCH', `/api/clients/${id}`, { growth_settings: { enabled: true, interval_days: 0 } }), false);
+  assert.equal(allowedCommand('PATCH', `/api/clients/${id}`, { aio_settings: { api_key: 'secret' } }), false);
 });
 
 test('worker endpoints reject missing bearer before database access', async () => {

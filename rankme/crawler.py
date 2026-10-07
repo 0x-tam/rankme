@@ -2,6 +2,7 @@
 import collections
 import http.client
 import ipaddress
+import json
 import re
 import socket
 import ssl
@@ -165,11 +166,15 @@ class _Page(HTMLParser):
         self.in_title = False
         self.canonical, self.robots, self.headings = '', [], []
         self.heading = None
+        self.anchors, self.anchor = [], None
+        self.schema, self.schema_parts = [], None
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
         if tag in ('script', 'style', 'noscript', 'svg'):
             self.hidden += 1
+        if tag == 'script' and a.get('type', '').split(';')[0].strip().lower() == 'application/ld+json' and len(self.schema) < 50:
+            self.schema_parts = []
         if tag == 'title':
             self.in_title = True
         if tag == 'meta' and a.get('name', '').lower() == 'description':
@@ -189,20 +194,40 @@ class _Page(HTMLParser):
                 link = normalize_url(urljoin(self.base, a['href']))
                 if link not in self.links:
                     self.links.append(link)
+                if len(self.anchors) < 200:
+                    self.anchor = {'url': link, 'text': '', 'aria_label': a.get('aria-label', '')[:300]}
+                    self.anchors.append(self.anchor)
             except (ValueError, UnicodeError):
                 pass
+        if tag == 'img' and self.anchor is not None and a.get('alt'):
+            self.anchor['text'] = (self.anchor['text'] + ' ' + a['alt']).strip()[:300]
 
     def handle_endtag(self, tag):
         if tag in ('script', 'style', 'noscript', 'svg'):
             self.hidden = max(0, self.hidden - 1)
+        if tag == 'script' and self.schema_parts is not None:
+            try:
+                value = json.loads(''.join(self.schema_parts))
+                values = value if isinstance(value, list) else [value]
+                types = [str(row['@type'])[:100] for row in values if isinstance(row, dict) and isinstance(row.get('@type'), str)][:20]
+                self.schema.append({'valid_json': True, 'types': types})
+            except (ValueError, TypeError):
+                self.schema.append({'valid_json': False, 'types': []})
+            self.schema_parts = None
         if tag == 'title':
             self.in_title = False
+        if tag == 'a':
+            self.anchor = None
         if tag in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
             self.heading = None
 
     def handle_data(self, data):
+        if self.schema_parts is not None and sum(map(len, self.schema_parts)) < 100000:
+            self.schema_parts.append(data[:100000])
         if self.in_title:
             self.title_parts.append(data)
+        if self.anchor is not None and data.strip():
+            self.anchor['text'] = (self.anchor['text'] + ' ' + data.strip()).strip()[:300]
         if not self.hidden and data.strip():
             self.parts.append(data.strip())
             if self.heading is not None:
@@ -292,7 +317,8 @@ def crawl_site(url, max_pages=24, progress=None, _canonical_hops=0):
                           'description': parser.description, 'text': '\n'.join(parser.parts)[:24000],
                           'links': parser.links[:200], 'status': result.get('status', 200),
                           'canonical': parser.canonical, 'robots': parser.robots[:20],
-                          'headings': parser.headings})
+                          'headings': parser.headings, 'anchors': parser.anchors,
+                          'schema': parser.schema})
             candidates = [link for link in parser.links if urlsplit(link).hostname == host
                           and not urlsplit(link).query and not re.search(
                               r'\.(pdf|jpg|png|zip|mp4|css|js|webp|gif|svg)$', urlsplit(link).path, re.I)]

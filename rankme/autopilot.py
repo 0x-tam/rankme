@@ -98,6 +98,46 @@ def _rebuild(engine, client_id):
             "evidence": item["evidence"], "query": item["query"], "reason": item["reason"],
             "suggested_action": item["suggested_action"],
             "score_explanation": "Research candidate: source quotation checked; demand, fit and feasibility still need research. Priority 45/100 is a heuristic."})
+    evidence_audit = _optional(store, "evidence_audits", client_id).get("audit") or {}
+    for action in evidence_audit.get("actions", [])[:30]:
+        if action.get("kind") not in ("gsc_leak", "gsc_overlap_review", "gsc_coverage_review", "gsc_gap_candidate"):
+            continue
+        # Query/page evidence prefers fixing an existing page. Candidate gaps remain briefs
+        # until a person checks complete coverage and current search intent.
+        target = action.get("existing_url") or action.get("url") or ""
+        report["opportunities"].append({"id": "audit-" + str(action["id"]), "kind": action["kind"],
+            "title": action.get("title", "Review search opportunity"), "url": target,
+            "query": action.get("query", ""), "score": 62 if action["kind"] == "gsc_leak" else 52,
+            "confidence": .65 if target else .45, "evidence": action.get("evidence", {}),
+            "reason": "Dated Search Console and sampled crawl evidence; check the page and query before editing.",
+            "suggested_action": ("Review and improve the existing page for this query. Preserve its URL and intent."
+                                 if target else "Verify full-site coverage and search intent before deciding whether new content is needed."),
+            "score_explanation": "Evidence-backed review priority, not a ranking prediction."})
+    from .ai_overviews import AIOCollector
+    from .seo_features import aio_settings
+    aio_config = aio_settings(client.get("aio_settings"))
+    collector = AIOCollector(engine.data_dir)
+    client_host = (urlsplit(client.get("url", "")).hostname or "").removeprefix("www.")
+    for query in aio_config["queries"]:
+        summary = collector.summarize(client_id, query, country=aio_config["country"], language=aio_config["language"],
+                                      location=aio_config["location"], device=aio_config["device"], days=30)
+        if not summary.get("enough_history"):
+            continue
+        for source in summary.get("citations", [])[:2]:
+            url = source.get("url", "")
+            if not url or (urlsplit(url).hostname or "").removeprefix("www.") == client_host:
+                continue
+            observed_pages = [p.get("url") for p in client.get("crawl", {}).get("pages", [])[:80]
+                              if isinstance(p, dict) and p.get("url")]
+            report["opportunities"].append({"id": "aio-" + hashlib.sha256((query + url).encode()).hexdigest()[:20],
+                "kind": "aio_cited_source_review", "title": "Review a repeatedly cited source for “" + query[:150] + "”",
+                "url": url, "query": query, "score": 50, "confidence": .55,
+                "evidence": {"source": "Google Search AI Overview observation", "basis_source": summary.get("basis_source"),
+                             "sample_days": summary.get("sample_days"), "days_cited": source.get("days_cited"),
+                             "citation_url": url, "sampled_client_pages": observed_pages[:20],
+                             "limitations": "Citation frequency is observed in one cohort; page claims and query intent need independent review."},
+                "suggested_action": "Read the cited page and compare its answer structure, sourcing, and intent with existing client pages. Prepare a specific page improvement brief if the gap is real.",
+                "score_explanation": "Repeated citation in a dated sample; priority is a review heuristic, not a citation prediction."})
     report["research"] = {"observed_at": research.get("observed_at"), "count": len(research.get("findings", [])),
                           "limitations": research.get("limitations", []), "rejected": research.get("rejected", 0)}
     report["crawl_observed_at"] = client.get("crawl_observed_at")
@@ -112,7 +152,7 @@ def _rebuild(engine, client_id):
     timestamp = now()
     for item in report["opportunities"]:
         local_id = item["id"]
-        original = owned_article(engine, client, item.get("url")) if item["kind"] == "refresh" else None
+        original = owned_article(engine, client, item.get("url")) if item["kind"] in ("refresh", "gsc_leak") else None
         if original:
             # A new owned revision can be refreshed again only with a later data window.
             if original.get("refresh_of"):
@@ -206,6 +246,28 @@ def execute_action(engine, job, progress):
         key = "auto_refresh" if item.get("execution_mode") == "refresh" else "auto_plan"
         if not config["enabled"] or not config[key] or client.get("status") == "paused":
             raise ValueError("Automatic follow-up was paused before this job started")
+    if item.get("kind") == "aio_cited_source_review":
+        from .crawler import crawl_site
+        progress("Reading the cited public source and comparing sampled client pages")
+        source_crawl = crawl_site(item["url"], max_pages=1, progress=progress)
+        if not source_crawl.get("pages"):
+            raise ValueError("The cited source could not be read under public-page rules; no source-backed brief was prepared")
+        source_page = source_crawl["pages"][0]
+        query_words = {word.casefold() for word in item.get("query", "").split() if len(word) >= 3}
+        candidates = []
+        for page in client.get("crawl", {}).get("pages", [])[:80]:
+            if not isinstance(page, dict) or not page.get("url"):
+                continue
+            title_words = {word.casefold() for word in str(page.get("title", "")).split()}
+            if query_words & title_words:
+                candidates.append({"url": page["url"], "title": str(page.get("title", ""))[:200]})
+        item = {**item, "evidence": {**item.get("evidence", {}), "source_inspection": {
+            "url": source_page.get("url"), "title": source_page.get("title"),
+            "description": source_page.get("description"), "headings": source_page.get("headings", [])[:12],
+            "text_excerpt": source_page.get("text", "")[:2000], "observed_at": now(),
+            "limitations": "Public HTML sample; citation does not verify factual support."},
+            "existing_page_candidates": candidates[:10],
+            "comparison_method": "Lexical title overlap only; editor must check query intent and page substance."}}
     progress("Preparing an evidence-backed next action")
     task_id = hashlib.sha256(("task:" + item["id"]).encode()).hexdigest()[:32]
     task = {"id": task_id, "client_id": client["id"], "title": item["title"], "kind": item["kind"],

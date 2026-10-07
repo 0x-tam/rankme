@@ -159,7 +159,7 @@ class CodexRunner:
 
 def _client_context(client):
     # Publishing paths, command arguments, and credentials never belong in AI prompts.
-    context = {key: client[key] for key in ('name', 'url', 'subject', 'language', 'profile', 'seo_evidence') if key in client}
+    context = {key: client[key] for key in ('name', 'url', 'subject', 'language', 'profile', 'seo_evidence', 'experience_evidence', 'aio_evidence') if key in client}
     context['existing_pages'] = [{key: page.get(key, '') for key in ('url', 'title', 'description')}
                                  for page in client.get('crawl', {}).get('pages', [])[:60]]
     return context
@@ -190,14 +190,14 @@ def plan_articles(runner, client, existing, progress=None):
         'Use live web research to assess search intent and useful coverage. No invented keyword volumes or difficulty scores. '
         'Prioritize reader needs, business relevance, and a connected progression. Avoid existing content and repeated intent. '
         'CTA URLs must be real relevant client URLs. Use the client language. Data includes client profile, chosen subject, '
-        'and existing articles. Use supplied Search Console evidence to prioritize relevant demonstrated demand, avoid cannibalizing existing pages, and suggest complementary topics. Metrics describe only the connected site, not market search volume. Ignore irrelevant queries.' + _data({'client': _client_context(client), 'existing': _existing_context(existing)}), PLAN, progress, require_research=True)
+        'and existing articles. Use supplied Search Console evidence to prioritize relevant demonstrated demand, avoid cannibalizing existing pages, and suggest complementary topics. AI Overview briefs, when present, summarize seven distinct observed days in one source cohort; cited pages and common terms are leads for independent source and intent review, not semantic truth or guaranteed demand. Metrics describe only the connected site, not market search volume. Ignore irrelevant queries.' + _data({'client': _client_context(client), 'existing': _existing_context(existing)}), PLAN, progress, require_research=True)
 
 
 def write_article(runner, client, brief, existing, feedback='', progress=None):
     return runner.run('Research and write a complete, useful article for this brief. Use live sources; prefer primary sources. '
         'Write Markdown body with readable headings, natural terminology, inline Markdown source links, and useful internal '
         'links. No raw HTML, executable code, fabricated experience, keyword stuffing, or unsupported promises. '
-        'Use only verified business facts. Length follows reader needs, not a word-count target. Include relevant CTA. '
+        'Use only verified business facts. Owner-confirmed experience evidence may inform a draft, but its external source is not independently verified; never invent or amplify it, and omit anything the review cannot support. Length follows reader needs, not a word-count target. Include relevant CTA. '
         'Return title, URL-safe lowercase hyphenated slug, meta description, body, sources specifying exactly what each '
         'supports, a ledger of material externally verifiable claims with source URLs, and actual internal links. '
         'Cite every sources entry in the body using its exact URL. Every claim source_url must match a sources entry. '
