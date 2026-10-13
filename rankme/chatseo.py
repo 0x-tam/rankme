@@ -81,6 +81,10 @@ def _http(url, payload, token='', form=False, session=''):
                 result = next((v for v in reversed(values) if isinstance(v, dict) and v.get('id') == payload.get('id')), {})
             else:
                 result = json.loads(text) if text else {}
+            # Streamable HTTP notifications have no JSON-RPC reply. ChatSEO
+            # acknowledges initialization with HTTP 202 and a JSON null body.
+            if result is None and response.status == 202 and url == MCP and payload.get('method') == 'notifications/initialized' and 'id' not in payload:
+                result = {}
             if not isinstance(result, dict):
                 raise ChatSEOError('ChatSEO returned an unexpected response.')
             return result, response.headers.get('Mcp-Session-Id', '')

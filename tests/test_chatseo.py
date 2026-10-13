@@ -117,6 +117,27 @@ class ProviderTests(unittest.TestCase):
                 request = opener.return_value.open.call_args.args[0]
                 self.assertEqual(request.get_header('User-agent'), 'RankMe/1.0')
 
+    def test_http_accepts_null_initialized_notification_only(self):
+        cases = ((MCP, {'jsonrpc': '2.0', 'method': 'notifications/initialized'}, 202, True),
+                 (MCP, {'jsonrpc': '2.0', 'method': 'notifications/initialized'}, 200, False),
+                 (MCP, {'jsonrpc': '2.0', 'method': 'notifications/initialized', 'id': 1}, 202, False),
+                 (MCP, {'jsonrpc': '2.0', 'method': 'initialize', 'id': 1}, 202, False),
+                 (TOKEN, {}, 202, False), (REGISTER, {}, 202, False))
+        for url, payload, status, accepted in cases:
+            response = Mock()
+            response.__enter__ = Mock(return_value=response)
+            response.__exit__ = Mock(return_value=False)
+            response.headers = {'Content-Type': 'application/json'}
+            response.status = status
+            response.read1.side_effect = [b'null', b'']
+            with self.subTest(url=url, payload=payload, status=status), patch('rankme.chatseo.build_opener') as opener:
+                opener.return_value.open.return_value = response
+                if accepted:
+                    self.assertEqual(_http(url, payload), ({}, ''))
+                else:
+                    with self.assertRaisesRegex(ChatSEOError, 'unexpected response'):
+                        _http(url, payload)
+
     def test_http_denial_identifies_stage_without_provider_secrets_or_plan_guess(self):
         cases = ((REGISTER, {}, 'application registration'),
                  (TOKEN, {'grant_type': 'authorization_code'}, 'sign-in completion'),
