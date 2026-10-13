@@ -316,6 +316,23 @@ class ProviderTests(unittest.TestCase):
         self.assertIn('list_site_actions', report['unavailable'])
         self.assertIn('list_conversations', report['unavailable'])
 
+    def test_real_action_summary_and_provenance_are_preserved(self):
+        action = {'id': 'action-1', 'type': 'CREATE_PAGE', 'status': 'PROPOSED',
+                  'summary': 'Create a page explaining dental implant options.',
+                  'target': {'keyword': 'dental implants', 'pageType': 'service', 'suggestedPath': '/dental-implants'},
+                  'recommendedAt': '2026-10-14T09:00:00Z', 'sourceConversationId': 'conversation-1',
+                  'sourceMessageId': 'message-1'}
+        self.p.tools['list_site_actions'] = {'inputSchema': {'properties': {'siteId': {}}}}
+        with patch.object(self.p, 'sync', return_value=self.p.status()), patch.object(self.p, 'call', return_value={'items': [action], 'total': 1, 'limit': 20, 'nextCursor': None}):
+            report = self.p.sync_client(self.client['id'])
+        saved = report['actions'][0]
+        self.assertEqual(saved['title'], action['summary'])
+        self.assertEqual(saved['description'], action['summary'])
+        self.assertEqual(saved['source'], 'chatseo')
+        self.assertEqual(saved['status'], 'PROPOSED')
+        for field in ('type', 'target', 'recommendedAt', 'sourceConversationId', 'sourceMessageId'):
+            self.assertEqual(saved[field], action[field])
+
 
 class ChatSEOOAuthHTTPTests(OAuthHTTPTests):
     # Inherit the real HTTP harness, plus its existing Google regressions.

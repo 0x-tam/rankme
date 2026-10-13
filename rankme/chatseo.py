@@ -426,9 +426,15 @@ class ChatSEO:
                             raise ChatSEOError('ChatSEO returned data for a different site.')
                         if not ID.fullmatch(str(row.get('id', ''))):
                             continue
-                        item = {'id': row['id'], 'title': _text(row.get('title', row.get('name', '')), 500)}
+                        title = next((row.get(field) for field in ('title', 'name', 'summary') if isinstance(row.get(field), str) and row[field].strip()), '')
+                        item = {'id': row['id'], 'title': _text(title, 500)}
                         if key == 'actions':
-                            item.update(description=_text(row.get('description', '')), status=_text(row.get('status', ''), 50), source='chatseo')
+                            item.update(description=_text(row.get('description') or row.get('summary', '')), status=_text(row.get('status', ''), 50), source='chatseo')
+                            for field in ('type', 'recommendedAt', 'sourceConversationId', 'sourceMessageId'):
+                                if isinstance(row.get(field), str):
+                                    item[field] = _text(row[field], 200)
+                            if isinstance(row.get('target'), dict):
+                                item['target'] = {field: _text(row['target'][field], 500) for field in ('keyword', 'pageType', 'suggestedPath') if isinstance(row['target'].get(field), str)}
                         result[key].append(item)
                 except ChatSEOError:
                     result[key] = []
