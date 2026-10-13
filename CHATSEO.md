@@ -13,6 +13,8 @@ This connection is separate from the Codex ChatSEO connector. Installing or sign
 
 Credentials live in the worker's private `chatseo-secrets.json`, mode 0600, outside the application database, backup payloads, cloud snapshots, browser, and prompts. OAuth uses PKCE S256, one-use state bound to the initiating owner session, and an exact loopback callback. Only fixed HTTPS ChatSEO endpoints are allowed; redirects are rejected. Disconnect deletes RankMe's local grants; remove application access in ChatSEO as well if remote revocation is desired.
 
+RankMe identifies its HTTPS requests as `RankMe/1.0`; ChatSEO rejected the default Python client identifier during live registration on 2026-10-14. A successful registration is reused when connecting again. Connection errors identify application registration, sign-in completion, access renewal, or API access. A registration denial happens before account sign-in and does not establish a problem with your plan or organization. If a denial persists after retrying, share the failed step and HTTP status with ChatSEO support; never share the credential file or callback URL.
+
 ## Data and paid requests
 
 Refresh reads the site list, credits, and the runtime tool catalog. Per-site sync reads recommendations and conversations only when a compatible site-filtered tool exists. Missing, rejected, or incompatible tools are shown as unavailable; RankMe does not invent success. Provider recommendations have a separate ChatSEO source and status and do not become local automated actions.

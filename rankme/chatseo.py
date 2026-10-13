@@ -32,6 +32,7 @@ READ_TOOLS = {'list_sites', 'get_credits', 'list_site_actions', 'list_conversati
 TOOLS = READ_TOOLS | {'send_message'}
 ID = re.compile(r'[A-Za-z0-9_-]{1,200}')
 MAX_RESPONSE = 2_000_000
+USER_AGENT = 'RankMe/1.0'
 
 
 class ChatSEOError(ValueError):
@@ -46,7 +47,8 @@ class _NoRedirect(HTTPRedirectHandler):
 def _http(url, payload, token='', form=False, session=''):
     if url not in ENDPOINTS:
         raise ChatSEOError('Untrusted ChatSEO endpoint.')
-    headers = {'Accept': 'application/json, text/event-stream', 'Content-Type':
+    # ChatSEO rejects urllib's default client identifier before OAuth sign-in.
+    headers = {'User-Agent': USER_AGENT, 'Accept': 'application/json, text/event-stream', 'Content-Type':
                'application/x-www-form-urlencoded' if form else 'application/json'}
     for key, value in (('Authorization', 'Bearer ' + token if token else ''), ('Mcp-Session-Id', session)):
         if value:
@@ -83,8 +85,14 @@ def _http(url, payload, token='', form=False, session=''):
                 raise ChatSEOError('ChatSEO returned an unexpected response.')
             return result, response.headers.get('Mcp-Session-Id', '')
     except HTTPError as exc:
+        # Never forward provider bodies/headers: they may contain credentials.
+        if url == REGISTER:
+            raise ChatSEOError(f'ChatSEO application registration failed (HTTP {exc.code}), before account sign-in. Try connecting again; if it persists, contact ChatSEO support.') from None
+        if url == TOKEN:
+            stage = 'access renewal' if payload.get('grant_type') == 'refresh_token' else 'sign-in completion'
+            raise ChatSEOError(f'ChatSEO {stage} failed (HTTP {exc.code}). Reconnect on the worker Mac; if it persists, contact ChatSEO support.') from None
         if exc.code in (401, 403):
-            raise ChatSEOError('ChatSEO access was denied. Reconnect and check your plan and organization.') from None
+            raise ChatSEOError(f'ChatSEO API access was denied (HTTP {exc.code}). Reconnect; if it persists, ask ChatSEO support to check this connection\'s access.') from None
         raise ChatSEOError('ChatSEO request failed. The provider may still have accepted submitted work.') from None
     except (URLError, OSError, TimeoutError, UnicodeError, json.JSONDecodeError):
         raise ChatSEOError('ChatSEO could not be reached or returned an unreadable response. Submitted work may still be running.') from None

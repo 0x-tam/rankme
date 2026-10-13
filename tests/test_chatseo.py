@@ -8,6 +8,7 @@ import time
 import unittest
 import uuid
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
 
 from rankme.chatseo import ChatSEO, ChatSEOError, _http, _remaining, MCP, TOKEN, REGISTER
@@ -100,6 +101,48 @@ class ProviderTests(unittest.TestCase):
             opener.return_value.open.return_value = response
             with self.assertRaisesRegex(ChatSEOError, 'size limit'):
                 _http(MCP, {})
+
+    def test_http_identifies_rankme_for_registration_tokens_and_mcp(self):
+        for url, payload, kwargs in ((REGISTER, {}, {}),
+                (TOKEN, {'grant_type': 'authorization_code'}, {'form': True}),
+                (MCP, {'id': 1}, {'token': 'PRIVATE_ACCESS'})):
+            response = Mock()
+            response.__enter__ = Mock(return_value=response)
+            response.__exit__ = Mock(return_value=False)
+            response.headers = {'Content-Type': 'application/json'}
+            response.read1.side_effect = [b'{}', b'']
+            with self.subTest(url=url), patch('rankme.chatseo.build_opener') as opener:
+                opener.return_value.open.return_value = response
+                _http(url, payload, **kwargs)
+                request = opener.return_value.open.call_args.args[0]
+                self.assertEqual(request.get_header('User-agent'), 'RankMe/1.0')
+
+    def test_http_denial_identifies_stage_without_provider_secrets_or_plan_guess(self):
+        cases = ((REGISTER, {}, 'application registration'),
+                 (TOKEN, {'grant_type': 'authorization_code'}, 'sign-in completion'),
+                 (TOKEN, {'grant_type': 'refresh_token'}, 'access renewal'),
+                 (MCP, {}, 'API access'))
+        for url, payload, stage in cases:
+            for status in (401, 403):
+                error = HTTPError(url, status, 'PRIVATE_PROVIDER_MESSAGE',
+                    {'Authorization': 'PRIVATE_HEADER'}, io.BytesIO(b'{"error":"PRIVATE_BODY"}'))
+                with self.subTest(stage=stage, status=status), patch('rankme.chatseo.build_opener') as opener:
+                    opener.return_value.open.side_effect = error
+                    with self.assertRaises(ChatSEOError) as raised:
+                        _http(url, payload)
+                message = str(raised.exception)
+                self.assertIn(stage, message)
+                self.assertIn(f'HTTP {status}', message)
+                self.assertNotIn('PRIVATE', message)
+                self.assertNotIn('plan', message)
+                self.assertNotIn('organization', message)
+
+    def test_connect_reuses_successful_registration(self):
+        self.p._save({'client_id': 'public', 'redirect_uri': self.app.chatseo_redirect})
+        with patch('rankme.chatseo._http') as http:
+            url = self.p.begin(self.app.chatseo_redirect)
+        http.assert_not_called()
+        self.assertEqual(parse_qs(urlsplit(url).query)['client_id'], ['public'])
 
     def test_paid_request_exact_text_durable_dedupe_and_conflicts(self):
         data = self.data()
