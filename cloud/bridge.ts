@@ -29,6 +29,29 @@ function hasSensitiveKey(value: unknown): boolean {
 export function allowedCommand(method: string, path: string, value: unknown): boolean {
   if (!object(value) || JSON.stringify(value).length > 100_000 || hasSensitiveKey(value)) return false;
   const body = value;
+  if (method === 'POST' && ['/api/chatseo/sync', '/api/chatseo/disconnect'].includes(path)) return Object.keys(body).length === 0;
+  const chatseo = new RegExp(`^/api/clients/${ID}/chatseo-(map|sync|settings|send|poll|import|resolve|read)$`).exec(path);
+  if (method === 'POST' && chatseo) {
+    const exact = (fields: string[]) => Object.keys(body).length === fields.length && fieldsOnly(body, fields);
+    const reference = (value: unknown) => typeof value === 'string' && /^[A-Za-z0-9_-]{1,200}$/.test(value);
+    const runId = (value: unknown) => typeof value === 'string' && new RegExp(`^${ID}$`).test(value);
+    switch (chatseo[1]) {
+      case 'sync': return exact([]);
+      case 'map': return exact(['site_id']) && reference(body.site_id);
+      case 'settings': return exact(['enabled', 'daily_request_limit', 'minimum_credits'])
+        && typeof body.enabled === 'boolean'
+        && Number.isInteger(body.daily_request_limit) && Number(body.daily_request_limit) >= 1 && Number(body.daily_request_limit) <= 10
+        && Number.isInteger(body.minimum_credits) && Number(body.minimum_credits) >= 1 && Number(body.minimum_credits) <= 100000;
+      case 'send': return exact(['message', 'credit_acknowledged', 'request_id'])
+        && typeof body.message === 'string' && body.message.trim().length > 0 && body.message.length <= 8000
+        && body.credit_acknowledged === true && typeof body.request_id === 'string'
+        && /^[a-fA-F0-9]{8}-(?:[a-fA-F0-9]{4}-){3}[a-fA-F0-9]{12}$/.test(body.request_id);
+      case 'resolve': return exact(['run_id', 'checked_provider']) && runId(body.run_id) && body.checked_provider === true;
+      case 'read':
+      case 'poll': return exact(['run_id']) && runId(body.run_id);
+      case 'import': return exact(['run_id', 'artifact_id']) && runId(body.run_id) && reference(body.artifact_id);
+    }
+  }
   if (method === 'POST' && path === '/api/clients') return fieldsOnly(body, ['url', 'name']) && typeof body.url === 'string';
   if (method === 'PATCH' && new RegExp(`^/api/clients/${ID}$`).test(path)) {
     if (!fieldsOnly(body, ['name', 'subject', 'profile', 'confirmed', 'automation', 'next_run', 'seo_connection', 'visibility_settings', 'image_brand', 'conversion_goal', 'aio_settings', 'growth_settings'], true)) return false;
@@ -101,6 +124,40 @@ export function allowedCommand(method: string, path: string, value: unknown): bo
   return routes.some(([route, fields]) => route.test(path) && fieldsOnly(body, fields));
 }
 
+// The enrolled owner's snapshot proves references before durable queueing; the
+// worker checks the current provider account/site binding again before execution.
+export function validateChatseoReferences(path: string, body: Record<string, unknown>, snapshot: Record<string, unknown>): void {
+  const match = new RegExp(`^/api/clients/(${ID})/chatseo-(map|sync|settings|send|poll|import|resolve|read)$`).exec(path);
+  if (!match) return;
+  const rows = (value: unknown): Record<string, unknown>[] => Array.isArray(value) ? value.filter(object) : [];
+  const client = rows(snapshot.clients).find(item => item.id === match[1]);
+  if (!client) throw new RangeError('Client not found in the owner snapshot. Sync the worker first.');
+  if (match[2] === 'map') {
+    const sites = object(snapshot.chatseo) ? rows(snapshot.chatseo.sites) : [];
+    if (!sites.some(site => site.id === body.site_id)) throw new RangeError('ChatSEO site is not in the connected account. Sync sites first.');
+  }
+  if (['poll', 'import', 'resolve', 'read'].includes(match[2])) {
+    const run = rows(snapshot.chatseo_runs).find(item => item.id === body.run_id && item.client_id === client.id && item.site_id === client.chatseo_site_id);
+    if (!run) throw new RangeError('ChatSEO request does not belong to this client and linked site.');
+    if (match[2] === 'import' && !rows(run.artifacts).some(item => item.id === body.artifact_id)) throw new RangeError('ChatSEO artifact does not belong to this request.');
+  }
+}
+
+export function chatseoSnapshotRead(path: string, snapshot: Record<string, unknown>): Record<string, unknown> | null {
+  const status = object(snapshot.chatseo) ? snapshot.chatseo : { connected: false, connection_required: true, local_connection_only: true, sites: [], capabilities: [], credits: { remaining: null } };
+  if (path === '/api/chatseo/status') return status;
+  if (path === '/api/chatseo/sites') return { sites: Array.isArray(status.sites) ? status.sites : [] };
+  const match = new RegExp(`^/api/clients/(${ID})/chatseo$`).exec(path);
+  if (!match) return null;
+  const rows = (value: unknown): Record<string, unknown>[] => Array.isArray(value) ? value.filter(object) : [];
+  const client = rows(snapshot.clients).find(item => item.id === match[1]);
+  if (!client) throw new RangeError('Client not found in the owner snapshot.');
+  return {
+    report: rows(snapshot.chatseo_reports).find(item => item.client_id === client.id && item.site_id === client.chatseo_site_id) ?? null,
+    runs: rows(snapshot.chatseo_runs).filter(item => item.client_id === client.id && item.site_id === client.chatseo_site_id),
+  };
+}
+
 function clean(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(clean);
   if (object(value)) {
@@ -163,6 +220,10 @@ export async function enqueueCommand(ownerId: string, method: string, path: stri
   return withTransaction(async client => {
     const owner = await client.query('SELECT id FROM rankme_cloud.owner WHERE id=$1 FOR SHARE', [ownerId]);
     if (!owner.rowCount) throw new RangeError('Owner enrollment required');
+    if (new RegExp(`^/api/clients/${ID}/chatseo-`).test(path)) {
+      const snapshot = await client.query('SELECT state FROM rankme_cloud.snapshot WHERE singleton=true');
+      validateChatseoReferences(path, body as Record<string, unknown>, object(snapshot.rows[0]?.state) ? snapshot.rows[0].state : {});
+    }
     const id = randomUUID().replaceAll('-', '');
     const inserted = await client.query(
       `INSERT INTO rankme_cloud.commands(id,owner_id,request_key,method,path,body)

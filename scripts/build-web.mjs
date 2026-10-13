@@ -3,7 +3,7 @@ import { resolve } from 'node:path';
 
 const root = resolve(import.meta.dirname, '..');
 const output = resolve(root, 'dist/public');
-const assets = ['index.html', 'app.js', 'seo-features.js', 'auth.js', 'styles.css', 'favicon.svg'];
+const assets = ['index.html', 'app.js', 'seo-features.js', 'chatseo.js', 'auth.js', 'styles.css', 'favicon.svg'];
 
 for (const asset of assets) {
   const info = await lstat(resolve(root, 'static', asset));

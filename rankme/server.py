@@ -35,6 +35,7 @@ class Application:
         self.engine = engine_factory(self.store, self.data_dir)
         self.instance = secrets.token_urlsafe(24)
         self.oauth_redirect = f"http://localhost:{port}/api/google/callback"
+        self.chatseo_redirect = f"http://localhost:{port}/api/chatseo/callback"
         self.start_worker_on_enroll = False
         self._engine_start_lock = threading.Lock()
         self._engine_started = False
@@ -383,6 +384,44 @@ class Application:
         parts = path.strip("/").split("/")
         if method == "GET" and path == "/api/state":
             return self.engine.state()
+        if path.startswith("/api/chatseo/"):
+            provider = self.engine.chatseo
+            if method == "GET" and path == "/api/chatseo/status":
+                return provider.status()
+            if method == "GET" and path == "/api/chatseo/sites":
+                return {"sites": provider.status()["sites"]}
+            if method == "POST" and not data:
+                if path == "/api/chatseo/connect":
+                    return {"url": provider.begin(self.chatseo_redirect)}
+                if path == "/api/chatseo/disconnect":
+                    return provider.disconnect()
+                if path == "/api/chatseo/sync":
+                    return provider.sync()
+            raise ValueError("Unsupported ChatSEO request")
+        if len(parts) == 4 and parts[:2] == ["api", "clients"] and parts[3].startswith("chatseo"):
+            provider, client_id, action = self.engine.chatseo, parts[2], parts[3]
+            self.store.get("clients", client_id)
+            if method == "GET" and action == "chatseo":
+                snapshot = provider.snapshot(client_id)
+                return {"report": next(iter(snapshot["chatseo_reports"]), None), "runs": snapshot["chatseo_runs"]}
+            if method == "POST":
+                if action == "chatseo-map" and set(data) == {"site_id"}:
+                    return provider.map_site(client_id, data["site_id"])
+                if action == "chatseo-sync" and not data:
+                    return self.engine.queue("chatseo-sync", client_id)
+                if action == "chatseo-settings":
+                    return provider.settings(client_id, data)
+                if action == "chatseo-send":
+                    return provider.send(client_id, data)
+                if action == "chatseo-read" and set(data) == {"run_id"}:
+                    return provider.read_run(client_id, data["run_id"])
+                if action == "chatseo-poll" and set(data) == {"run_id"}:
+                    return provider.poll(client_id, data["run_id"])
+                if action == "chatseo-resolve" and set(data) == {"run_id", "checked_provider"}:
+                    return provider.resolve(client_id, data["run_id"], data["checked_provider"])
+                if action == "chatseo-import" and set(data) == {"run_id", "artifact_id"}:
+                    return provider.import_artifact(client_id, data["run_id"], data["artifact_id"])
+            raise ValueError("Unsupported ChatSEO website request")
         if len(parts) == 4 and parts[:2] == ["api", "experience"]:
             from .seo_features import update_experience
             claim = self.store.get("experience_claims", parts[2])
@@ -706,6 +745,21 @@ def handler_for(app):
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
+            if method == "GET" and path == "/api/chatseo/callback":
+                if host != f"localhost:{port}":
+                    return self.send(403, {"error": "Connection failed"})
+                query = parse_qs(urlparse(self.path).query)
+                session = self.session()
+                try:
+                    state = query.get("state", [""])[0]
+                    app.auth.consume_oauth(session[0] if session else "", "chatseo:" + state)
+                    issuer = query.get("iss", ["https://api.chatseo.app/auth"])[0]
+                    if issuer != "https://api.chatseo.app/auth":
+                        raise ValueError("Invalid issuer")
+                    app.engine.chatseo.callback(query.get("code", [""])[0], state, app.chatseo_redirect)
+                    return self.send(200, '<!doctype html><title>ChatSEO connected</title><h1>ChatSEO connected</h1><p>Return to RankMe to refresh sites and choose your website.</p><a href="/">Open RankMe</a>', "text/html; charset=utf-8")
+                except Exception:
+                    return self.send(400, '<!doctype html><title>Connection incomplete</title><h1>ChatSEO connection incomplete</h1><p>Return to RankMe on this Mac and try again.</p><a href="/">Open RankMe</a>', "text/html; charset=utf-8")
             # Google returns by top-level cross-site navigation. SameSite=Lax
             # supplies the initiating session; state and PKCE remain one-use.
             if method == "GET" and path == "/api/google/callback":
@@ -801,6 +855,11 @@ def handler_for(app):
                     raise KeyError("Endpoint not found")
                 if path.startswith("/api/") and not session:
                     return self.send(401, {"error": "Authentication required"})
+                if method == "POST" and path == "/api/chatseo/connect":
+                    result = app.dispatch(method, path, data)
+                    state = parse_qs(urlparse(result["url"]).query).get("state", [""])[0]
+                    app.auth.begin_oauth(session[0], "chatseo:" + state)
+                    return self.send(200, result)
                 if method == "POST" and path == "/api/google/connect":
                     result = app.dispatch(method, path, data)
                     state = parse_qs(urlparse(result["url"]).query).get("state", [""])[0]
@@ -856,8 +915,8 @@ def handler_for(app):
                     return self.send(200, app.dispatch(method, path, data))
                 if method != "GET":
                     raise KeyError("Endpoint not found")
-                names = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/seo-features.js": "seo-features.js", "/auth.js": "auth.js", "/styles.css": "styles.css", "/favicon.svg": "favicon.svg"}
-                names.update({"/static/" + name: name for name in ("app.js", "seo-features.js", "auth.js", "styles.css", "favicon.svg")})
+                names = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/seo-features.js": "seo-features.js", "/chatseo.js": "chatseo.js", "/auth.js": "auth.js", "/styles.css": "styles.css", "/favicon.svg": "favicon.svg"}
+                names.update({"/static/" + name: name for name in ("app.js", "seo-features.js", "chatseo.js", "auth.js", "styles.css", "favicon.svg")})
                 if path not in names:
                     raise KeyError("Page not found")
                 file = ROOT / "static" / names[path]

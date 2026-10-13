@@ -254,3 +254,7 @@ Open a client and choose **SEO & links**. Connect your own Google Desktop OAuth 
 Connected properties refresh daily while the local server runs, unless automatic Google sync or the workspace is paused. Backlink research uses the signed-in Codex subscription, verifies source pages, and saves personalized outreach drafts. You can also track a known external page. Known pages are checked weekly while the server runs; latest observed link status remains separate from outreach status. No messages are sent or reciprocal network links placed. See [backlink research](BACKLINKS.md).
 
 This does not provide a market-wide keyword-volume database, a full backlink index, guaranteed rankings, or acquired placements. Google metrics require account authorization; outreach drafts require a real editorial relationship to become links. OAuth secrets stay outside database backups and AI prompts.
+
+## Optional ChatSEO provider
+
+The Visibility workspace can connect an independent ChatSEO account for provider recommendations, explicitly approved paid requests, and artifact imports into unreviewed drafts. Free/direct tools remain available. See [ChatSEO setup and safeguards](CHATSEO.md) for the local OAuth connection, hosted worker behavior, credit controls, and limits.

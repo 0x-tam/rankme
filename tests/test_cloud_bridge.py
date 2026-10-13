@@ -73,6 +73,50 @@ class BridgeTests(unittest.TestCase):
         self.assertFalse(allowed_command("POST", f"/api/articles/{ident}/publish", {"force": True}))
         self.assertFalse(allowed_command("POST", "/api/google/configure", {"client_secret": "x"}))
 
+    def test_chatseo_command_boundaries(self):
+        ident = "a" * 32
+        path = f"/api/clients/{ident}/chatseo-"
+        send = {"message": "Research this site", "credit_acknowledged": True,
+                "request_id": "12345678-1234-1234-1234-123456789abc"}
+        for action in ("sync", "disconnect"):
+            self.assertTrue(allowed_command("POST", f"/api/chatseo/{action}", {}))
+        for action, body in (("sync", {}), ("map", {"site_id": "site_1"}),
+                             ("settings", {"enabled": True, "daily_request_limit": 2, "minimum_credits": 10}),
+                             ("send", send), ("poll", {"run_id": ident}), ("read", {"run_id": ident}),
+                             ("resolve", {"run_id": ident, "checked_provider": True}),
+                             ("import", {"run_id": ident, "artifact_id": "artifact_1"})):
+            self.assertTrue(allowed_command("POST", path + action, body))
+        for action in ("connect", "configure", "callback", "execute", "retry"):
+            self.assertFalse(allowed_command("POST", f"/api/chatseo/{action}", {}))
+        for key in ("token", "authorization", "endpoint", "tool", "force", "api_key"):
+            self.assertFalse(allowed_command("POST", path + "send", {**send, key: "unsafe"}))
+        for patch in ({"credit_acknowledged": False}, {"request_id": ident}, {"message": " "}, {"message": "x" * 8001}):
+            self.assertFalse(allowed_command("POST", path + "send", {**send, **patch}))
+        self.assertFalse(allowed_command("POST", path + "map", {"site_id": "https://evil.test"}))
+        self.assertFalse(allowed_command("POST", path + "import", {"run_id": ident, "artifact_id": "../artifact"}))
+        for daily in (0, 11, True, 1.5):
+            self.assertFalse(allowed_command("POST", path + "settings", {"enabled": True, "daily_request_limit": daily, "minimum_credits": 1}))
+        self.assertFalse(allowed_command("POST", path + "settings", {"enabled": True, "daily_request_limit": 1, "minimum_credits": 0}))
+        self.assertFalse(allowed_command("POST", path + "resolve", {"run_id": ident, "checked_provider": False}))
+        self.assertFalse(allowed_command("POST", path + "resolve", {"run_id": ident, "checked_provider": True, "force": True}))
+        self.assertFalse(allowed_command("PATCH", path + "send", send))
+
+    def test_chatseo_paid_command_replay_does_not_dispatch_twice(self):
+        worker = CloudWorker(self.app, self.config)
+        self.addCleanup(worker.stop)
+        worker.enrollment_seen = True
+        command = {"id": "a" * 32, "method": "POST", "path": "/api/clients/" + "b" * 32 + "/chatseo-send",
+                   "body": {"message": "Research this site", "credit_acknowledged": True,
+                            "request_id": "12345678-1234-1234-1234-123456789abc"}}
+        worker._request = lambda path, body: {"ok": True}
+        worker.handle_command(command)
+        worker.handle_command(command)
+        self.assertEqual(len(self.app.calls), 1)
+        changed = {**command, "body": {**command["body"], "message": "Changed message"}}
+        with self.assertRaises(ValueError):
+            worker.handle_command(changed)
+        self.assertEqual(len(self.app.calls), 1)
+
     def test_command_journal_prevents_reexecution_and_retries_ack(self):
         worker = CloudWorker(self.app, self.config)
         self.addCleanup(worker.stop)

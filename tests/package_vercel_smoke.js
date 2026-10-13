@@ -9,6 +9,7 @@ const html = fs.readFileSync(path.join(publicRoot, 'index.html'), 'utf8');
 const references = [...html.matchAll(/(?:src|href)=["'](\/static\/[^"']+)["']/g)]
   .map(match => match[1]);
 assert(references.includes('/static/seo-features.js'), 'SEO workspace script must be referenced');
+assert(references.includes('/static/chatseo.js'), 'ChatSEO workspace script must be referenced');
 for (const reference of references) {
   const asset = path.join(publicRoot, reference.slice(1));
   assert(fs.statSync(asset).isFile(), `${reference} must be included in the Vercel package`);

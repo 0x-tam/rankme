@@ -58,6 +58,8 @@ class Engine:
         from .vercel import Vercel
         self.google = GoogleData(self.data_dir)
         self.vercel = Vercel(self.data_dir)
+        from .chatseo import ChatSEO
+        self.chatseo = ChatSEO(self.data_dir, self.store)
         self.stop_event = threading.Event()
         self.wake = threading.Event()
         self.guard = threading.RLock()
@@ -96,7 +98,7 @@ class Engine:
         threading.Thread(target=self.check_status, name="rankme-codex-status", daemon=True).start()
 
     def queue(self, kind, client_id, article_id=None, **extra):
-        if kind not in ("inspect", "plan", "generate", "review", "cover", "publish", "verify", "seo-sync", "backlinks-discover", "backlink-check", "visibility-audit", "visibility-research", "visibility-action", "visibility-probe", "style", "brand-guide", "aio-collect", "evidence-audit"):
+        if kind not in ("inspect", "plan", "generate", "review", "cover", "publish", "verify", "seo-sync", "backlinks-discover", "backlink-check", "visibility-audit", "visibility-research", "visibility-action", "visibility-probe", "style", "brand-guide", "aio-collect", "evidence-audit", "chatseo-sync"):
             raise ValueError("Unknown job type")
         self.store.get("clients", client_id)
         with self.guard:
@@ -415,6 +417,9 @@ class Engine:
                 from .autopilot import rebuild
                 rebuild(self, client_id)
                 self.store.event("Evidence audit ready", client_id)
+            elif job["kind"] == "chatseo-sync":
+                progress("Reading ChatSEO recommendations and conversations")
+                self.chatseo.sync_client(client_id)
             elif job["kind"] == "seo-sync":
                 self.store.update("clients", client_id, seo_attempt_at=now())
                 connection = client.get("seo_connection", {})
@@ -849,6 +854,7 @@ class Engine:
                     "brief": build_ai_overview_brief(summary) if summary.get("enough_history") else {"status": "insufficient_evidence"}})
         return {"clients": clients, "articles": articles, "jobs": jobs, "events": events,
                 "settings": self.store.settings(), "status": self.codex_status,
+                **self.chatseo.snapshot(),
                 "google": self.google.status(), "vercel": self.vercel.status(), "seo": seo, "backlinks": self.store.all("backlinks"),
                 "visibility": visibility, "opportunities": self.store.all("opportunities"),
                 "tasks": self.store.all("tasks"), "research": self.store.all("research"),

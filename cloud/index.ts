@@ -1,6 +1,6 @@
 import { AuthError, createAuthService, authErrorResponse } from './auth';
 import { getPool } from './db';
-import { enqueueCommand, getCommand, getSnapshot, handleWorker } from './bridge';
+import { chatseoSnapshotRead, enqueueCommand, getCommand, getSnapshot, handleWorker } from './bridge';
 
 const PUBLIC_ORIGIN = 'https://getrankme.vercel.app';
 const auth = createAuthService(getPool(), { publicOrigin: process.env.RANKME_PUBLIC_ORIGIN ?? PUBLIC_ORIGIN });
@@ -114,11 +114,14 @@ async function route(request: Request): Promise<Response> {
       const visibility = (snapshot.visibility as Record<string, unknown>[] || []).find(row => row.client_id === report[1]) || {};
       return file(`rankme-visibility-${report[1]}.json`, JSON.stringify({ ...visibility, opportunities: (snapshot.opportunities as Record<string, unknown>[] || []).filter(row => row.client_id === report[1]), tasks: (snapshot.tasks as Record<string, unknown>[] || []).filter(row => row.client_id === report[1]), measurements: (snapshot.measurements as Record<string, unknown>[] || []).filter(row => row.client_id === report[1]), experiments: (snapshot.experiments as Record<string, unknown>[] || []).filter(row => row.client_id === report[1]) }), 'application/json; charset=utf-8');
     }
+    const chatseo = chatseoSnapshotRead(path, snapshot);
+    if (chatseo) return json(chatseo);
     if (path === '/api/google/properties') return unavailable('Google account setup and property selection run on your Mac.');
     return json({ error: 'Not found.' }, 404);
   }
 
   if (!['POST', 'PATCH', 'DELETE'].includes(request.method)) return json({ error: 'Method not allowed.' }, 405);
+  if (path.startsWith('/api/chatseo/') && !['/api/chatseo/sync', '/api/chatseo/disconnect'].includes(path)) return unavailable('Connect ChatSEO in the local RankMe workspace.');
   if (path.startsWith('/api/google/') || path === '/api/connection/check' || path === '/api/settings/check') return unavailable();
   if (!request.headers.get('content-type')?.toLowerCase().startsWith('application/json')) return json({ error: 'JSON content type required.' }, 415);
   const body = await readJson(request);

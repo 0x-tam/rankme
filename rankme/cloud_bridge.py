@@ -34,6 +34,34 @@ def allowed_command(method, path, body):
     if has_sensitive_key(body):
         return False
     fields = set(body)
+    if method == "POST" and path in ("/api/chatseo/sync", "/api/chatseo/disconnect"):
+        return not fields
+    chatseo = re.fullmatch(rf"/api/clients/{ID}/chatseo-(map|sync|settings|send|poll|import|resolve|read)", path)
+    if method == "POST" and chatseo:
+        action = chatseo.group(1)
+        reference = lambda value: isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,200}", value) is not None
+        run_id = lambda value: isinstance(value, str) and re.fullmatch(ID, value) is not None
+        if action == "sync":
+            return not fields
+        if action == "map":
+            return fields == {"site_id"} and reference(body["site_id"])
+        if action == "settings":
+            return (fields == {"enabled", "daily_request_limit", "minimum_credits"}
+                    and type(body["enabled"]) is bool
+                    and type(body["daily_request_limit"]) is int and 1 <= body["daily_request_limit"] <= 10
+                    and type(body["minimum_credits"]) is int and 1 <= body["minimum_credits"] <= 100000)
+        if action == "send":
+            return (fields == {"message", "credit_acknowledged", "request_id"}
+                    and isinstance(body["message"], str) and 1 <= len(body["message"]) <= 8000
+                    and bool(body["message"].strip()) and body["credit_acknowledged"] is True
+                    and isinstance(body["request_id"], str)
+                    and re.fullmatch(r"[a-fA-F0-9]{8}-(?:[a-fA-F0-9]{4}-){3}[a-fA-F0-9]{12}", body["request_id"]) is not None)
+        if action == "resolve":
+            return fields == {"run_id", "checked_provider"} and run_id(body["run_id"]) and body["checked_provider"] is True
+        if action in ("poll", "read"):
+            return fields == {"run_id"} and run_id(body["run_id"])
+        if action == "import":
+            return fields == {"run_id", "artifact_id"} and run_id(body["run_id"]) and reference(body["artifact_id"])
     if method == "POST" and path == "/api/clients":
         return fields <= {"url", "name"} and isinstance(body.get("url"), str)
     if method == "PATCH" and re.fullmatch(rf"/api/clients/{ID}", path):

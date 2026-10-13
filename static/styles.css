@@ -149,3 +149,19 @@ button:disabled{cursor:not-allowed}
 .seo-day-grid .badge{margin:6px 0}
 .seo-day-grid p{font-size:12px;line-height:1.6;max-height:140px;overflow:auto;overflow-wrap:anywhere}
 @media(max-width:720px){.seo-evidence-row{flex-wrap:wrap}.seo-evidence-row .actions{width:100%}.seo-feature-card .card-head .actions{width:100%}}
+
+/* Optional ChatSEO uses the same accessible controls and card layout as free tools. */
+.chatseo-card{min-width:0;overflow-wrap:anywhere}
+.chatseo-card .card-head{align-items:flex-start;flex-wrap:wrap}
+.chatseo-card .card-head>div:first-child{max-width:720px}
+.chatseo-card .button{min-height:44px}
+.chatseo-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:20px;margin:24px 0 0}
+.chatseo-summary dt{color:var(--muted);font-size:12px}
+.chatseo-summary dd{margin:6px 0 0;font-size:16px;font-weight:600}
+.chatseo-card .disclosure{margin-top:20px}
+.chatseo-card .disclosure>summary{min-height:44px;align-content:center}
+.chatseo-run{padding:20px 0;border-bottom:1px solid var(--line);min-width:0}
+.chatseo-run:first-child{padding-top:0}
+.chatseo-text{white-space:pre-wrap;overflow-wrap:anywhere;font-size:14px;line-height:1.7;max-height:480px;overflow:auto}
+.chatseo-run>p{margin-top:12px}
+@media(max-width:720px){.chatseo-summary{grid-template-columns:minmax(0,1fr);gap:16px}.chatseo-card .card-head .actions{width:100%}.chatseo-card .actions>.button{flex:1 1 180px}.chatseo-card .seo-evidence-row>.button{width:100%}}

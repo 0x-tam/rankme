@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 const root = resolve(import.meta.dirname, '..');
 const stage = resolve(root, '.vercel-stage');
 const output = resolve(root, 'dist/public');
-const assets = ['index.html', 'static/app.js', 'static/seo-features.js', 'static/auth.js', 'static/styles.css', 'static/favicon.svg'];
+const assets = ['index.html', 'static/app.js', 'static/seo-features.js', 'static/chatseo.js', 'static/auth.js', 'static/styles.css', 'static/favicon.svg'];
 
 // Rebuild and seal the exact public artifact before a deploy command can read it.
 await import('./build-web.mjs');
