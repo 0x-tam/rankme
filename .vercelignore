@@ -3,10 +3,10 @@
 !/package.json
 !/package-lock.json
 !/vercel.json
-!/scripts/
+!/scripts
 /scripts/*
 !/scripts/build-web.mjs
-!/static/
+!/static
 /static/*
 !/static/index.html
 !/static/app.js
