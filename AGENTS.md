@@ -5,6 +5,14 @@ tasks. Act as architect and orchestrator; complete work reliably with the lowest
 sufficient implementation model and reasoning level. Preserve the product scope:
 outreach is excluded, and security is important.
 
+## Lumident department coverage
+
+For Lumident SEO work, assess all three departments: adult dentistry, pediatric
+dentistry, and orthodontics. Prioritize evidence-backed opportunities within each
+department; do not default to adult services alone. Check deployed pages and
+completed work before proposing or implementing changes. Do not duplicate content
+or invent clinic-specific clinical claims to make department coverage appear equal.
+
 ## Jev decision layer
 
 Use the official TypeSafe skill (`typesafe-ai`) as the Jev decision/control layer.
