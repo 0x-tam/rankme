@@ -26,6 +26,18 @@ class GoogleTests(unittest.TestCase):
         self.assertNotIn('secret-value',json.dumps(result))
         self.assertEqual(os.stat(self.google.path).st_mode&0o777,0o600)
         with self.assertRaises(GoogleDataError):self.google.configure('invalid')
+    def test_disconnected_connection_does_not_misreport_missing_scope(self):
+        self.google.configure(CLIENT)
+        with patch('rankme.google_data._http') as http:
+            with self.assertRaisesRegex(GoogleDataError, 'Google is not connected'):
+                self.google._token(SEARCH_SCOPE)
+            http.assert_not_called()
+    def test_partial_grant_is_reported_as_needing_reconnection(self):
+        self.connected()
+        data=self.google._read();data['scope']=SEARCH_SCOPE;self.google._save(data)
+        status=self.google.status()
+        self.assertTrue(status['search_console']);self.assertFalse(status['analytics'])
+        self.assertIn('Reconnect Google', status['message'])
     def test_oauth_pkce_state_and_single_use_callback(self):
         self.google.configure(CLIENT)
         url=self.google.begin('http://127.0.0.1:8787/google/callback');q=parse_qs(urlsplit(url).query)

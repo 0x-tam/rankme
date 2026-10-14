@@ -35,6 +35,10 @@ python3.12 -m venv .venv
 
 Double-click **Start RankMe.command**. The launcher uses `.venv`, starts the loopback service, and opens `http://localhost:8787` in your browser. Closing the browser or launcher terminal does not stop the background service. The launcher reuses a running service only when its private process record and server instance match.
 
+For automatic startup at macOS login and recovery after the worker exits, run `.venv/bin/python scripts/launch.py --install-background --data-dir /absolute/path/to/rankme-data`. This installs a private login agent that checks the worker every minute, without opening a browser. An enrolled worker starts its engine and cloud sync without a local dashboard sign-in. The Mac must be logged in, awake, and online; dashboard access still requires its passkey. Google needs its own one-time connection in local Settings, with both read-only permissions, so it can refresh data in the background.
+
+Before intentionally stopping the worker for maintenance, run the same command with `--remove-background`, then use `--stop`. Removing automatic startup leaves the current worker running. Reinstall automatic startup after maintenance. The installer refuses to replace another data directory's startup configuration on the same port.
+
 To enroll the first owner passkey, explicitly run this on the Mac and complete the browser prompt:
 
 ```bash

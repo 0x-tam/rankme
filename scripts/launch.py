@@ -5,6 +5,7 @@ import fcntl
 import importlib.util
 import json
 import os
+import plistlib
 import secrets
 import shlex
 import signal
@@ -12,6 +13,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -30,6 +32,80 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+
+
+def background_config(data, port):
+    return {
+        'Label': 'com.rankme.worker.' + str(port),
+        'ProgramArguments': [sys.executable, str(ROOT / 'scripts' / 'launch.py'),
+                             '--no-open', '--port', str(port), '--data-dir', str(data)],
+        'WorkingDirectory': str(ROOT),
+        'RunAtLoad': True,
+        'StartInterval': 60,
+        'ProcessType': 'Background',
+        'Umask': 0o077,
+    }
+
+
+def configure_background(data, port, remove=False):
+    """The login agent checks the verified launcher; it never unlocks the UI."""
+    if sys.platform != 'darwin':
+        print('Automatic background startup requires macOS.', file=sys.stderr)
+        return 1
+    config = background_config(data, port)
+    folder = Path.home() / 'Library' / 'LaunchAgents'
+    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    info = folder.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+        print('Unsafe LaunchAgents directory.', file=sys.stderr)
+        return 1
+    path = folder / (config['Label'] + '.plist')
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        existing = None
+    else:
+        with os.fdopen(fd, 'rb') as handle:
+            info = os.fstat(handle.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_nlink != 1 or info.st_mode & 0o077 or info.st_size > 16384):
+                raise ValueError('Unsafe background startup file')
+            existing = plistlib.load(handle)
+        if existing != config:
+            raise ValueError('Existing background startup belongs to a different RankMe configuration')
+    target = 'gui/' + str(os.getuid()) + '/' + config['Label']
+    registered = subprocess.run(['/bin/launchctl', 'print', target],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    if remove:
+        if existing is None:
+            print('No matching RankMe background startup is installed.')
+            return 0
+        if registered:
+            subprocess.run(['/bin/launchctl', 'bootout', target], check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        path.unlink()
+        print('Automatic startup removed. The current worker keeps running until you stop it.')
+        return 0
+    if registered and existing is None:
+        raise ValueError('An unrecognized background service already uses this label')
+    if existing is None:
+        with tempfile.NamedTemporaryFile('wb', dir=folder, prefix='.rankme-', delete=False) as handle:
+            temporary = Path(handle.name)
+            os.fchmod(handle.fileno(), 0o600)
+            plistlib.dump(config, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    if not registered:
+        subprocess.run(['/bin/launchctl', 'bootstrap', 'gui/' + str(os.getuid()), str(path)],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print('Background startup enabled at macOS login, with a health check every minute. '
+          'No dashboard sign-in is needed to keep an enrolled worker running. '
+          'This Mac must remain awake and online.')
+    return 0
 
 
 def probe(port):
@@ -174,16 +250,24 @@ def main(argv=None):
     parser.add_argument('--enroll', action='store_true', help='Explicitly start first-owner passkey enrollment')
     parser.add_argument('--stop', action='store_true', help='Stop an idle service started by this launcher')
     parser.add_argument('--status', action='store_true', help='Show whether RankMe is running')
+    parser.add_argument('--install-background', action='store_true', help='Start automatically at macOS login and recover a stopped worker')
+    parser.add_argument('--remove-background', action='store_true', help='Remove automatic startup without stopping the current worker')
     args = parser.parse_args(argv)
     if sys.version_info < (3, 10):
         parser.error('Python 3.10 or later is required; Python 3.12 is recommended')
     if not 1024 <= args.port <= 65535:
         parser.error('Port must be between 1024 and 65535')
-    if sum((args.enroll, args.stop, args.status)) > 1 or (args.enroll and args.no_open):
+    if sum((args.enroll, args.stop, args.status, args.install_background, args.remove_background)) > 1 or (args.enroll and args.no_open):
         parser.error('--enroll requires opening a browser and cannot be combined with --stop, --status, or --no-open')
     data = Path(args.data_dir).expanduser().resolve()
     data.mkdir(parents=True, exist_ok=True)
     data.chmod(0o700)
+    if args.install_background or args.remove_background:
+        try:
+            return configure_background(data, args.port, args.remove_background)
+        except (OSError, ValueError, subprocess.SubprocessError, plistlib.InvalidFileException):
+            print('Could not safely configure background startup. Check the LaunchAgents file and macOS login session.', file=sys.stderr)
+            return 1
     record_path = data / ('launcher-%s.json' % args.port)
     lock_fd = os.open(data / 'launcher.lock', os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     with os.fdopen(lock_fd, 'w') as lock:

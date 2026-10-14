@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import signal
+import stat
 import sys
 import threading
 from datetime import timedelta
@@ -20,6 +21,30 @@ from .store import Store, uid
 from .engine import Engine, first_run, parse_date, safe_error, brand_digest
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def acquire_data_lock(data_dir):
+    """Lock before constructing providers, whose recovery can change persisted state."""
+    data = Path(data_dir).expanduser().resolve()
+    data.mkdir(parents=True, exist_ok=True, mode=0o700)
+    directory_info = data.lstat()
+    if (not stat.S_ISDIR(directory_info.st_mode) or directory_info.st_uid != os.getuid()
+            or directory_info.st_mode & 0o077):
+        raise ValueError("RankMe data directory must be owner-only")
+    descriptor = os.open(data / "server.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_nlink != 1 or info.st_mode & 0o022):
+            raise ValueError("Unsafe RankMe server lock")
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Older workers created a readable 0644 lock inside the private directory.
+        # Tighten the verified inode only after ownership of the lock is acquired.
+        os.fchmod(descriptor, 0o600)
+        return os.fdopen(descriptor, "r+")
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 class Application:
@@ -952,13 +977,12 @@ def main(argv=None):
         if not sys.stdin.isatty() or not sys.stdout.isatty():
             parser.error("Passkey recovery requires an interactive local terminal")
         data_dir = Path(args.data_dir).expanduser().resolve()
-        data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        descriptor = os.open(data_dir / "server.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            recovery_lock = acquire_data_lock(data_dir)
         except BlockingIOError:
-            os.close(descriptor)
             parser.error("Stop RankMe before passkey recovery")
+        except (OSError, ValueError):
+            parser.error("Cannot safely lock the RankMe data directory")
         try:
             print("This removes every RankMe passkey. Existing sessions end when the server restarts.")
             if input("Type RESET RANKME PASSKEYS to continue: ") != "RESET RANKME PASSKEYS":
@@ -968,16 +992,20 @@ def main(argv=None):
             print("Passkeys reset. Start RankMe, then run the launcher's explicit --enroll command.")
             return 0
         finally:
-            os.close(descriptor)
-    app = Application(args.data_dir, port=args.port)
-    data_lock = (app.data_dir / "server.lock").open("a")
+            recovery_lock.close()
     try:
-        fcntl.flock(data_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        data_lock = acquire_data_lock(args.data_dir)
     except BlockingIOError:
-        data_lock.close()
-        app.store.close()
         print("This data directory is already used by another RankMe server.", file=sys.stderr)
         return 1
+    except (OSError, ValueError):
+        print("Cannot safely lock the RankMe data directory.", file=sys.stderr)
+        return 1
+    try:
+        app = Application(args.data_dir, port=args.port)
+    except BaseException:
+        data_lock.close()
+        raise
     try:
         server = Server(("127.0.0.1", args.port), handler_for(app))
     except OSError as exc:

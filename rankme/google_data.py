@@ -220,6 +220,8 @@ class GoogleData:
             message = 'Google is connected with read-only access.' if connected else 'Connect your Google account.'
             if not data.get('client_id'):
                 message = 'Configure a Google Desktop OAuth client first.'
+            elif connected and not set(SCOPES).issubset(scopes):
+                message = 'Reconnect Google and grant read-only access to Search Console and Analytics.'
             elif connected and not data.get('refresh_token'):
                 message = 'Connected for this session. Reconnect to enable offline refresh.'
             return {'configured': bool(data.get('client_id')), 'connected': connected,
@@ -277,6 +279,8 @@ class GoogleData:
     def _token(self, scope):
         with self.lock:
             data = self._read()
+            if not data.get('refresh_token') and not (data.get('access_token') and data.get('expires_at', 0) > time.time()):
+                raise GoogleDataError('Google is not connected. Open Settings on your Mac and connect Google once to enable background refresh.')
             if scope not in set(str(data.get('scope', '')).split()):
                 raise GoogleDataError('Required Google read-only permission was not granted. Reconnect and grant access.')
             if data.get('access_token') and data.get('expires_at', 0) > time.time() + 60:

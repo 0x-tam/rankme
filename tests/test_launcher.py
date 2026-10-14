@@ -2,6 +2,8 @@
 import contextlib
 import importlib.util
 import io
+import os
+import plistlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +17,53 @@ SPEC.loader.exec_module(launcher)
 
 
 class LauncherTests(unittest.TestCase):
+    def test_background_agent_starts_without_browser_and_preserves_exact_paths(self):
+        config = launcher.background_config(Path('/tmp/private data'), 18787)
+        args = config['ProgramArguments']
+        self.assertIn('--no-open', args)
+        self.assertNotIn('--enroll', args)
+        self.assertEqual(args[-1], '/tmp/private data')
+        self.assertTrue(config['RunAtLoad'])
+        self.assertEqual(config['StartInterval'], 60)
+        self.assertNotIn('EnvironmentVariables', config)
+
+    def test_background_install_and_remove_preserves_existing_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            data = home / 'data'
+            with patch.object(launcher.sys, 'platform', 'darwin'), patch.object(launcher.Path, 'home', return_value=home), \
+                    patch.object(launcher.subprocess, 'run') as run, contextlib.redirect_stdout(io.StringIO()):
+                run.return_value.returncode = 1
+                self.assertEqual(launcher.configure_background(data, 18787), 0)
+                path = home / 'Library/LaunchAgents/com.rankme.worker.18787.plist'
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                with path.open('rb') as stream:
+                    self.assertEqual(plistlib.load(stream), launcher.background_config(data, 18787))
+                run.return_value.returncode = 0
+                self.assertEqual(launcher.configure_background(data, 18787, remove=True), 0)
+                self.assertFalse(path.exists())
+                self.assertFalse(any('kill' in str(call) for call in run.call_args_list))
+
+    def test_background_install_refuses_other_configuration_and_symlinks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            folder = home / 'Library/LaunchAgents'
+            folder.mkdir(parents=True)
+            path = folder / 'com.rankme.worker.18787.plist'
+            with path.open('wb') as stream:
+                plistlib.dump(launcher.background_config(home / 'other', 18787), stream)
+            path.chmod(0o600)
+            with patch.object(launcher.sys, 'platform', 'darwin'), patch.object(launcher.Path, 'home', return_value=home), \
+                    patch.object(launcher.subprocess, 'run') as run:
+                with self.assertRaises(ValueError):
+                    launcher.configure_background(home / 'data', 18787)
+                run.assert_not_called()
+                path.unlink()
+                path.symlink_to(home / 'target')
+                with self.assertRaises(OSError):
+                    launcher.configure_background(home / 'data', 18787)
+                self.assertFalse((home / 'target').exists())
+
     def test_probe_uses_only_public_health(self):
         class Response:
             status = 200
