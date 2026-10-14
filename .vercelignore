@@ -10,6 +10,8 @@
 /static/*
 !/static/index.html
 !/static/app.js
+!/static/seo-features.js
+!/static/chatseo.js
 !/static/auth.js
 !/static/styles.css
 !/static/favicon.svg

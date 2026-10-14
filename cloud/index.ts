@@ -1,6 +1,7 @@
 import { AuthError, createAuthService, authErrorResponse } from './auth';
 import { getPool } from './db';
 import { chatseoSnapshotRead, enqueueCommand, getCommand, getSnapshot, handleWorker } from './bridge';
+import { BookingError, bookingHistory, confirmBooking, exportBookingData, issueReference, issueTestReference, listBookings, lookupReference, publicReferenceCors, updateBooking } from './bookings';
 
 const PUBLIC_ORIGIN = 'https://getrankme.vercel.app';
 const auth = createAuthService(getPool(), { publicOrigin: process.env.RANKME_PUBLIC_ORIGIN ?? PUBLIC_ORIGIN });
@@ -42,9 +43,9 @@ function snapshotState(snapshot: Record<string, unknown>): Record<string, unknow
     bridge,
   };
 }
-async function readJson(request: Request): Promise<unknown> {
+async function readJson(request: Request, maxBytes = 2_000_000): Promise<unknown> {
   const declared = Number(request.headers.get('content-length') || '0');
-  if (declared > 2_000_000) throw new RangeError('Request is too large.');
+  if (declared > maxBytes) throw new RangeError('Request is too large.');
   const reader = request.body?.getReader();
   if (!reader) return {};
   const pieces: Uint8Array[] = [];
@@ -53,7 +54,7 @@ async function readJson(request: Request): Promise<unknown> {
     const { done, value } = await reader.read();
     if (done) break;
     length += value.byteLength;
-    if (length > 2_000_000) {
+    if (length > maxBytes) {
       await reader.cancel();
       throw new RangeError('Request is too large.');
     }
@@ -72,6 +73,16 @@ async function route(request: Request): Promise<Response> {
   const path = url.pathname;
   if (!path.startsWith('/api/')) return json({ error: 'Not found.' }, 404);
 
+  if (path === '/api/public/booking-reference') {
+    const cors = publicReferenceCors(request);
+    if (request.method === 'OPTIONS') return secure(new Response(null, { status: 204, headers: cors }));
+    if (request.method !== 'POST') return json({ error: 'Method not allowed.' }, 405);
+    if (!request.headers.get('content-type')?.toLowerCase().startsWith('application/json')) return json({ error: 'JSON content type required.' }, 415);
+    const result = json(await issueReference(request, await readJson(request, 256)), 201);
+    for (const [key, value] of cors) result.headers.set(key, value);
+    return result;
+  }
+
   if (path.startsWith('/api/worker/')) return secure(await handleWorker(request));
 
   const handled = await auth.handle(request);
@@ -80,6 +91,27 @@ async function route(request: Request): Promise<Response> {
   const mutation = !['GET', 'HEAD'].includes(request.method);
   const session = await auth.requireSession(request, mutation);
   if (!session) return json({ error: 'Unlock the workspace first.' }, 401);
+
+  if (path === '/api/bookings' && request.method === 'GET') return json(await listBookings(session.ownerId));
+  if (path === '/api/bookings/export' && request.method === 'GET')
+    return file('lumident-bookings.json', JSON.stringify({ format: 'rankme-lumident-bookings-v1', exported_at: new Date().toISOString(), ...await exportBookingData(session.ownerId) }), 'application/json; charset=utf-8');
+  if (path === '/api/bookings/test-reference' && request.method === 'POST') {
+    if (!request.headers.get('content-type')?.toLowerCase().startsWith('application/json')) return json({ error: 'JSON content type required.' }, 415);
+    return json(await issueTestReference(session.ownerId, await readJson(request, 256)), 201);
+  }
+  const reference = /^\/api\/bookings\/references\/(LM-[A-F0-9]{12})$/.exec(path);
+  if (reference && request.method === 'GET') return json(await lookupReference(session.ownerId, reference[1]));
+  const history = /^\/api\/bookings\/([a-f0-9-]{36})\/history$/.exec(path);
+  if (history && request.method === 'GET') return json(await bookingHistory(session.ownerId, history[1]));
+  if (path === '/api/bookings' && request.method === 'POST') {
+    if (!request.headers.get('content-type')?.toLowerCase().startsWith('application/json')) return json({ error: 'JSON content type required.' }, 415);
+    return json(await confirmBooking(session.ownerId, request, await readJson(request, 512)), 201);
+  }
+  const booking = /^\/api\/bookings\/([a-f0-9-]{36})$/.exec(path);
+  if (booking && request.method === 'PATCH') {
+    if (!request.headers.get('content-type')?.toLowerCase().startsWith('application/json')) return json({ error: 'JSON content type required.' }, 415);
+    return json(await updateBooking(session.ownerId, booking[1], await readJson(request, 512)));
+  }
 
   if (request.method === 'GET' && path === '/api/state') {
     return json(snapshotState((await getSnapshot(session.ownerId)) as Record<string, unknown>));
@@ -93,7 +125,7 @@ async function route(request: Request): Promise<Response> {
     const snapshot = snapshotState((await getSnapshot(session.ownerId)) as Record<string, unknown>);
     const clients = snapshot.clients as Record<string, unknown>[];
     const articles = snapshot.articles as Record<string, unknown>[];
-    if (path === '/api/backup') return file('rankme-cloud-backup.json', JSON.stringify({ format: 'rankme-cloud-snapshot-v1', exported_at: new Date().toISOString(), last_synced_at: (snapshot.bridge as Record<string, unknown>).lastSeen, state: snapshot }), 'application/json; charset=utf-8');
+    if (path === '/api/backup') return file('rankme-cloud-backup.json', JSON.stringify({ format: 'rankme-cloud-snapshot-v2', exported_at: new Date().toISOString(), last_synced_at: (snapshot.bridge as Record<string, unknown>).lastSeen, state: snapshot, lumident_bookings: await exportBookingData(session.ownerId) }), 'application/json; charset=utf-8');
     const article = /^\/api\/articles\/([a-f0-9]+)\/download$/.exec(path);
     if (article) {
       const item = articles.find(row => row.id === article[1]);
@@ -142,6 +174,7 @@ export default {
       if (error instanceof RangeError) return json({ error: error.message }, 400);
       if (error instanceof SyntaxError) return json({ error: error.message }, 400);
       if (error instanceof AuthError) return secure(authErrorResponse(error));
+      if (error instanceof BookingError) return json({ error: error.message }, error.status);
       console.error('RankMe cloud request failed', error instanceof Error ? error.name : 'unknown');
       return json({ error: 'The workspace is temporarily unavailable.' }, 503);
     }
