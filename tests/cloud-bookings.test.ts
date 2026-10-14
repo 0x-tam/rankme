@@ -52,6 +52,8 @@ test('Lumident confirmations keep source linkage, test isolation, history and id
     await assert.rejects(updateBooking(randomUUID(), a.id, { status: 'cancelled' }), { status: 404 });
     await assert.rejects(bookingHistory(randomUUID(), a.id), { status: 404 });
     const testRef = await issueTestReference(ownerId, { department: 'orthodontics' });
+    assert.deepEqual({ department: testRef.department, source: testRef.source, test_mode: testRef.test_mode },
+      { department: 'orthodontics', source: 'unknown', test_mode: true });
     await assert.rejects(confirmBooking(ownerId, request(), { reference: testRef.reference, department: 'orthodontics' }), { status: 409 });
     const testBooking = await confirmBooking(ownerId, request(), { reference: testRef.reference, department: 'orthodontics', test_mode: true });
     assert.equal(testBooking.test_mode, true);
@@ -93,6 +95,13 @@ test('Lumident confirmations keep source linkage, test isolation, history and id
     const valid = await route('/api/bookings', 'POST', { department: 'pediatric', test_mode: true }, { Origin: 'https://getrankme.vercel.app', 'Content-Type': 'application/json', 'X-RankMe-CSRF': csrf, 'Idempotency-Key': randomUUID() });
     assert.equal(valid.status, 201);
     assert.equal((await valid.json()).test_mode, true);
+    const testReferenceResponse = await route('/api/bookings/test-reference', 'POST', { department: 'pediatric' },
+      { Origin: 'https://getrankme.vercel.app', 'Content-Type': 'application/json', 'X-RankMe-CSRF': csrf });
+    assert.equal(testReferenceResponse.status, 201);
+    const testReference = await testReferenceResponse.json();
+    assert.deepEqual({ department: testReference.department, source: testReference.source, test_mode: testReference.test_mode },
+      { department: 'pediatric', source: 'unknown', test_mode: true });
+    assert.match(testReference.reference, /^LM-[A-F0-9]{12}$/);
     const exportResponse = await route('/api/bookings/export');
     assert.equal(exportResponse.status, 200);
     assert.equal(exportResponse.headers.get('cache-control'), 'no-store, private');

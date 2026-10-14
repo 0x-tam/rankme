@@ -82,7 +82,7 @@ export async function issueTestReference(ownerId: string, input: unknown) {
   const code = `LM-${randomBytes(6).toString('hex').toUpperCase()}`;
   await getPool().query(`INSERT INTO rankme_cloud.booking_references(code,owner_id,department,source,test_mode)
     VALUES($1,$2,$3,'unknown',true)`, [code, ownerId, chosen]);
-  return { reference: code, test_mode: true };
+  return { reference: code, department: chosen, source: 'unknown', test_mode: true };
 }
 
 export async function lookupReference(ownerId: string, value: unknown) {
